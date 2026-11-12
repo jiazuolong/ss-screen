@@ -7010,12 +7010,16 @@ class MainWindow(QMainWindow):
         return self._windows_path_to_wsl(str(_find_project_root(root)))
 
     def _windows_arg_to_wsl(self, value: str) -> str:
+        if PureWindowsPath(value).drive.lower().startswith(("\\\\wsl.localhost\\", "\\\\wsl$\\")):
+            return self._windows_path_to_wsl(value)
         if len(value) >= 3 and value[1] == ":" and value[2] in {"\\", "/"}:
             return self._windows_path_to_wsl(value)
         return value.replace("\\", "/")
 
     def _windows_path_to_wsl(self, value: str) -> str:
         path = PureWindowsPath(value)
+        if path.drive.lower().startswith(("\\\\wsl.localhost\\", "\\\\wsl$\\")):
+            return "/" + "/".join(path.parts[1:])
         drive = path.drive.rstrip(":").lower()
         if not drive:
             return value.replace("\\", "/")
