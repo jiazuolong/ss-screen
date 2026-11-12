@@ -26,6 +26,7 @@ htmlcov/
 .mypy_cache/
 .ruff_cache/
 data/
+!src/ssscreen/data/
 
 # Web frontend and browser-test outputs
 web/frontend/node_modules/

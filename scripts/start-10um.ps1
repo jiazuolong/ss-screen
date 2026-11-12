@@ -27,7 +27,13 @@ try {
         $url = "https://github.com/astral-sh/uv/releases/download/0.9.18/uv-$platform-pc-windows-msvc.zip"
         Write-Host 'Downloading Windows environment manager...'
         & curl.exe --fail --location --retry 3 --connect-timeout 30 --speed-time 120 --speed-limit 1024 --silent --show-error --output $archive $url
-        if ($LASTEXITCODE -or (Get-FileHash -LiteralPath $archive).Hash -ne $hash) { throw 'Windows uv download failed verification.' }
+        if ($LASTEXITCODE) { throw 'Windows uv download failed.' }
+        $sha = [Security.Cryptography.SHA256]::Create()
+        $stream = [IO.File]::OpenRead($archive)
+        try {
+            $actual = [BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '')
+        } finally { $stream.Dispose(); $sha.Dispose() }
+        if ($actual -ne $hash) { throw 'Windows uv download failed verification.' }
         Add-Type -AssemblyName System.IO.Compression.FileSystem
         $zip = [IO.Compression.ZipFile]::OpenRead($archive)
         try {
