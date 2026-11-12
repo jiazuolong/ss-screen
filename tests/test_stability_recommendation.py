@@ -10,6 +10,78 @@ from ssscreen.config import RecommendationSettings
 from ssscreen.stability.recommendation import generate_recommendations
 
 
+def test_explicit_mixed_gap_sources_are_found_without_claiming_method_equivalence():
+    from ssscreen.stability.recommendation import _Assessment, _evaluate_gap_evidence
+
+    pair = pd.Series(
+        dict(
+            mp_id_a="a",
+            mp_id_b="b",
+            gap_a=0.09,
+            gap_b=0.26,
+            gap_method="mixed_sources",
+            gap_method_a="external-a",
+            gap_method_b="external-b",
+        )
+    )
+    gaps = pd.DataFrame(
+        [
+            dict(
+                material_id="a",
+                method="external-a",
+                band_gap=0.09,
+                is_direct=True,
+                status="success",
+            ),
+            dict(
+                material_id="b",
+                method="external-b",
+                band_gap=0.26,
+                is_direct=False,
+                status="success",
+            ),
+            dict(
+                material_id="a",
+                method="old-method",
+                band_gap=0.57,
+                is_direct=False,
+                status="success",
+            ),
+        ]
+    )
+    assessment = _Assessment()
+    result = _evaluate_gap_evidence(
+        pair, gaps, method_override=None, settings=RecommendationSettings(), assessment=assessment
+    )
+    assert result["complete"] and result["gap_evidence_status"] == "complete"
+    assert result["gap_a_eV"] == 0.09
+    assert not assessment.missing
+    assert "gap:mixed_sources" in assessment.uncertain
+
+    pair["gap_method_b"] = "absent-method"
+    result = _evaluate_gap_evidence(
+        pair,
+        gaps,
+        method_override=None,
+        settings=RecommendationSettings(),
+        assessment=_Assessment(),
+    )
+    assert not result["complete"]
+    assert result["gap_evidence_status"] == "missing_source"
+
+    pair["gap_method_b"] = "external-b"
+    pair["gap_b"] = 0.3
+    result = _evaluate_gap_evidence(
+        pair,
+        gaps,
+        method_override=None,
+        settings=RecommendationSettings(),
+        assessment=_Assessment(),
+    )
+    assert not result["complete"]
+    assert result["gap_evidence_status"] == "incompatible"
+
+
 def _write_csv(path, records, columns=None):
     frame = pd.DataFrame.from_records(records, columns=columns)
     frame.to_csv(path, index=False)

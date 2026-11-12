@@ -182,6 +182,62 @@ def screen_composition_candidates(
     return candidates, summary
 
 
+def screen_composition_batches(
+    df: pd.DataFrame,
+    *,
+    element_counts: Iterable[int],
+    max_bandgap: float,
+    max_e_hull: float,
+    excluded_elements: set[str],
+    min_group_size: int = 2,
+    min_x_elements: int = 2,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Run the existing binary/ternary rules and combine their candidates."""
+    counts = list(dict.fromkeys(element_counts))
+    if not counts or any(count not in (2, 3) for count in counts):
+        raise ValueError("Select binary (2), ternary (3), or both.")
+    if not df.index.is_unique or df.index.hasnans:
+        raise ValueError("Input material IDs must be unique and non-null.")
+    if not all(isinstance(value, str) for value in df.index):
+        raise ValueError("Input material IDs must be strings in the DataFrame index.")
+
+    tables, reports = [], []
+    for count in counts:
+        table, report = screen_composition_candidates(
+            df,
+            nelems=count,
+            max_bandgap=max_bandgap,
+            max_e_hull=max_e_hull,
+            excluded_elements=excluded_elements,
+            min_group_size=min_group_size,
+            min_x_elements=min_x_elements,
+        )
+        if len(counts) > 1:
+            table["nelems"] = count
+        tables.append(table)
+        reports.append(report)
+
+    candidates = pd.concat(tables, ignore_index=True)
+    summary = dict(reports[0])
+    if len(counts) > 1:
+        summary["nelems"] = counts
+        for key in ("selected_rows", "template_count", "candidate_rows"):
+            summary[key] = sum(report[key] for report in reports)
+    summary["by_nelems"] = {str(n): report for n, report in zip(counts, reports, strict=True)}
+    summary["unique_candidate_materials"] = int(candidates["material_id"].nunique())
+    return candidates, summary
+
+
+def candidate_structures(df: pd.DataFrame, candidates: pd.DataFrame) -> pd.DataFrame:
+    """Extract each selected material once, preserving original structures/columns."""
+    if "structure" not in df.columns:
+        raise ValueError("Candidate structure export requires a 'structure' column.")
+    selected = df.loc[candidates["material_id"].drop_duplicates().tolist()].copy()
+    if selected["structure"].isna().any():
+        raise ValueError("Candidate structure export found missing structures.")
+    return selected
+
+
 def attach_band_gaps(
     groups: Iterable[StructureGroup],
     template_entries: list[list],

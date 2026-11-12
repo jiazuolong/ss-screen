@@ -139,10 +139,14 @@ def group_similar_structures(
         rest: list[str] = []
         for x in spectator_elements:
             rest.append(x)
+            normalized_environments = []
             for name, geo_type in item[x]:
                 if name != "None":
                     name = swap_elem_by_X(name, elem)
-                rest.append(name + "," + geo_type)
+                normalized_environments.append(name + "," + geo_type)
+            # Ported from the audited 2026-09-23 envmatch_canonical snapshot:
+            # set iteration (and pre-substitution order) is not a fingerprint.
+            rest.extend(sorted(normalized_environments))
         repr = repr + "|".join(rest)
 
         reprs.append(repr)

@@ -181,6 +181,91 @@ def test_relax_manifest_writes_complete_results_and_resumes(tmp_path):
     assert resumed == records
 
 
+def test_gui_relaxation_handoff_checks_current_evidence(tmp_path):
+    from ssscreen.gui.relax_results import relaxation_status
+    from ssscreen.gui.sqs_results import file_sha256
+
+    manifest = _write_manifest(tmp_path)
+    pairs = tmp_path / "pairs.csv"
+    pd.DataFrame(
+        [{"mp_id_a": "mp-cas", "mp_id_b": "mp-case", "comp_a": "CaS", "comp_b": "CaSe"}] * 4
+    ).to_csv(pairs, index=False)
+    model = tmp_path / "fixture.model"
+    model.write_bytes(b"fake model for GUI tests only")
+
+    class Backend(FakeBackend):
+        @property
+        def metadata(self):
+            return {**super().metadata, "model_sha256": file_sha256(model)}
+
+    output, results = tmp_path / "relax", tmp_path / "results.jsonl"
+    records = relax_manifest(
+        manifest_path=manifest,
+        output_dir=output,
+        results_path=results,
+        backend=Backend(),
+        include_endmembers=True,
+        fmax=0.03,
+        max_steps=77,
+    )
+    params = {
+        "backend": "fake",
+        "model_path": str(model),
+        "model_name": "fixture",
+        "dtype": "float64",
+        "fmax": 0.03,
+        "max_steps": 77,
+        "relax_cell": True,
+    }
+
+    def status(parameters=None, external=False):
+        return relaxation_status(
+            tmp_path,
+            str(manifest),
+            str(pairs),
+            str(results),
+            str(output),
+            parameters or params,
+            external=external,
+        )
+
+    assert status()["ready"] and status()["usable_pairs"] == 1
+    assert status()["evidence_valid"] and status()["usable_sqs"] == 1
+    assert not status({**params, "fmax": 0.04})["ready"]
+    for changed in (
+        model,
+        Path(records[0]["input_structure"]["path"]),
+        Path(records[0]["output_structure"]["path"]),
+    ):
+        original = changed.read_bytes()
+        changed.write_bytes(original + b"\n")
+        assert not status()["ready"]
+        changed.write_bytes(original)
+    original_results = results.read_text()
+    results.write_text(
+        "\n".join(json.dumps(row) for row in records if row["structure_role"] == "sqs")
+    )
+    assert not status()["ready"]  # No endpoint energies.
+    assert status()["evidence_valid"] and status()["usable_sqs"] == 1  # Phonons can use SQS only.
+    results.write_text(original_results)
+    assert status({**params, "model_path": "remote.model"}, external=True)["ready"]
+    records = [json.loads(line) for line in original_results.splitlines()]
+    records[-1]["backend"]["model_sha256"] = "different-model"
+    results.write_text("\n".join(json.dumps(row) for row in records))
+    assert not status({**params, "model_path": "remote.model"}, external=True)["ready"]
+    results.write_text(original_results)
+    records = [json.loads(line) for line in original_results.splitlines()]
+    records[0]["status"] = "not_converged"
+    records[0]["usable_for_thermodynamics"] = False
+    results.write_text("\n".join(json.dumps(row) for row in records))
+    assert status()["not_converged"] == 1 and not status()["ready"]
+    results.write_text(original_results)
+    wrong_pairs = pd.read_csv(pairs)
+    wrong_pairs.loc[3, "mp_id_a"] = "another-material"
+    wrong_pairs.to_csv(pairs, index=False)
+    assert not status()["ready"]
+
+
 def test_relax_manifest_marks_not_converged_as_unusable(tmp_path):
     records = relax_manifest(
         manifest_path=_write_manifest(tmp_path),
@@ -231,11 +316,15 @@ def test_relax_manifest_rejects_resume_with_different_settings(tmp_path):
 
 
 def test_old_manifest_can_load_endmembers_from_dataset(tmp_path):
+    from ssscreen.gui.relax_results import relaxation_status, requires_endpoint_dataset
+
     manifest = _write_manifest(tmp_path)
+    assert not requires_endpoint_dataset(manifest)
     record = json.loads(manifest.read_text())
     record.pop("endpoint_a_structure_path")
     record.pop("endpoint_b_structure_path")
     manifest.write_text(json.dumps(record) + "\n")
+    assert requires_endpoint_dataset(manifest)
     dataset = pd.DataFrame(
         [
             {"material_id": "mp-cas", "structure": _structure(("Ca", "S"))},
@@ -254,3 +343,42 @@ def test_old_manifest_can_load_endmembers_from_dataset(tmp_path):
 
     assert len(tasks) == 3
     assert all(task.structure_path.is_file() for task in tasks)
+    output = tmp_path / "relax"
+    results = output / "results.jsonl"
+    relax_manifest(
+        manifest_path=manifest,
+        output_dir=output,
+        results_path=results,
+        dataset_path=dataset_path,
+        include_endmembers=True,
+        backend=FakeBackend(),
+        fmax=0.03,
+        max_steps=77,
+    )
+    pairs = tmp_path / "pairs.csv"
+    pd.DataFrame([{"mp_id_a": "mp-cas", "mp_id_b": "mp-case"}] * 4).to_csv(pairs, index=False)
+    params = {
+        "backend": "fake",
+        "model_path": "remote.model",
+        "dtype": "float64",
+        "fmax": 0.03,
+        "max_steps": 77,
+        "relax_cell": True,
+        "dataset_path": dataset_path,
+    }
+
+    def status():
+        return relaxation_status(
+            tmp_path,
+            str(manifest),
+            str(pairs),
+            str(results),
+            str(output),
+            params,
+            external=True,
+        )
+
+    assert status()["ready"]
+    dataset.loc["mp-cas", "structure"].scale_lattice(300)
+    dataset.to_pickle(dataset_path)
+    assert not status()["ready"]

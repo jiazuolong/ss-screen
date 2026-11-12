@@ -29,6 +29,8 @@ class CondenseSummary:
     written: int = 0
     skipped: int = 0
     failed: int = 0
+    stopped: bool = False
+    pending: int = 0
 
 
 @dataclass(frozen=True)
@@ -147,7 +149,9 @@ def write_index(records: Sequence[CondenseRecord], index_path: str | Path | None
         return
     path = Path(index_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame.from_records([asdict(record) for record in records]).to_csv(path, index=False)
+    pd.DataFrame.from_records(
+        [asdict(record) for record in records], columns=list(CondenseRecord.__dataclass_fields__)
+    ).to_csv(path, index=False)
 
 
 def _record_for_file(material_id: str, path: Path, status: str, error: str = "") -> CondenseRecord:
@@ -182,6 +186,7 @@ def condense_materials(
     condense_func=condense_structure,
     condenser=None,
     continue_on_error: bool = True,
+    stop_file: str | Path | None = None,
 ) -> CondenseSummary:
     """Condense ``(material_id, structure)`` pairs into per-material JSON files."""
     summary, records = _condense_materials_with_records(
@@ -193,6 +198,7 @@ def condense_materials(
         continue_on_error=continue_on_error,
         manifest_path=manifest_path,
         index_path=index_path,
+        stop_file=stop_file,
     )
     _write_jsonl(records, manifest_path)
     write_index(records, index_path)
@@ -209,41 +215,66 @@ def _condense_materials_with_records(
     continue_on_error: bool = True,
     manifest_path: str | Path | None = None,
     index_path: str | Path | None = None,
+    stop_file: str | Path | None = None,
 ) -> tuple[CondenseSummary, list[CondenseRecord]]:
-    """Condense materials and return records without writing sidecars."""
+    """Journal attempts and save an index on completion, cancellation or error."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     records: list[CondenseRecord] = []
     written = skipped = failed = 0
-    for material_id, structure in materials:
-        material_id = str(material_id)
-        outpath = output_dir / f"{material_id}.json"
-        if outpath.exists() and not overwrite:
-            skipped += 1
-            records.append(_record_for_file(material_id, outpath, "skipped"))
-            continue
-        try:
-            condensed = condense_func(structure, condenser=condenser)
-            _atomic_dumpfn(condensed, outpath)
-            written += 1
-            records.append(_record_for_file(material_id, outpath, "written"))
-        except Exception as exc:
-            failed += 1
-            records.append(
-                CondenseRecord(
-                    material_id=material_id,
-                    status="failed",
-                    output_path=str(outpath),
-                    error=str(exc),
+    stopped = False
+    _write_jsonl([], manifest_path)
+    try:
+        for material_id, structure in materials:
+            if stop_file is not None and Path(stop_file).is_file():
+                stopped = True
+                break
+            material_id = str(material_id)
+            outpath = output_dir / f"{material_id}.json"
+            try:
+                if outpath.exists() and not overwrite:
+                    skipped += 1
+                    records.append(_record_for_file(material_id, outpath, "skipped"))
+                else:
+                    condensed = condense_func(structure, condenser=condenser)
+                    _atomic_dumpfn(condensed, outpath)
+                    written += 1
+                    records.append(_record_for_file(material_id, outpath, "written"))
+            except KeyboardInterrupt:
+                # A terminal interrupt may arrive during one structure. Its
+                # output is atomic; completed earlier JSONs remain usable.
+                stopped = True
+                break
+            except Exception as exc:
+                failed += 1
+                records.append(
+                    CondenseRecord(
+                        material_id=material_id,
+                        status="failed",
+                        output_path=str(outpath),
+                        error=str(exc),
+                    )
                 )
-            )
-            if not continue_on_error:
-                _write_jsonl(records, manifest_path)
-                write_index(records, index_path)
-                raise
+                if not continue_on_error:
+                    raise
+            if manifest_path is not None:
+                with Path(manifest_path).open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(asdict(records[-1]), sort_keys=True) + "\n")
+    finally:
+        _write_jsonl(records, manifest_path)
+        write_index(records, index_path)
 
-    return CondenseSummary(written=written, skipped=skipped, failed=failed), records
+    return (
+        CondenseSummary(
+            written=written,
+            skipped=skipped,
+            failed=failed,
+            stopped=stopped,
+            pending=len(materials) - len(records),
+        ),
+        records,
+    )
 
 
 def dataframe_materials(
@@ -278,6 +309,7 @@ def condense_dataframe(
     condense_func=condense_structure,
     condenser=None,
     continue_on_error: bool = True,
+    stop_file: str | Path | None = None,
 ) -> CondenseSummary:
     """Condense structures from a normalized dataset DataFrame archive."""
     if condenser is None and condense_func is condense_structure:
@@ -296,6 +328,7 @@ def condense_dataframe(
         condense_func=condense_func,
         condenser=condenser,
         continue_on_error=continue_on_error,
+        stop_file=stop_file,
     )
 
 
@@ -307,6 +340,7 @@ def condense_paths(
     manifest_path: str | Path | None = None,
     index_path: str | Path | None = None,
     continue_on_error: bool = True,
+    stop_file: str | Path | None = None,
 ) -> CondenseSummary:
     """Condense input structure files into ``{material_id}.json`` outputs."""
     condenser = _make_condenser()
@@ -340,6 +374,7 @@ def condense_paths(
         continue_on_error=continue_on_error,
         manifest_path=manifest_path,
         index_path=index_path,
+        stop_file=stop_file,
     )
     records = [*load_failure_records, *condense_records]
     _write_jsonl(records, manifest_path)
@@ -348,6 +383,8 @@ def condense_paths(
         written=summary.written,
         skipped=summary.skipped,
         failed=summary.failed + load_failures,
+        stopped=summary.stopped,
+        pending=summary.pending,
     )
 
 

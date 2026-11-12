@@ -370,8 +370,8 @@ def _load_method_metadata(path: str | Path | None) -> tuple[dict[str, Any] | Non
     return metadata, _canonical_sha256(canonical)
 
 
-def _load_gap_tasks(path: str | Path) -> pd.DataFrame:
-    tasks = _read_table(path).copy()
+def _load_gap_tasks(path: str | Path | pd.DataFrame) -> pd.DataFrame:
+    tasks = path.copy() if isinstance(path, pd.DataFrame) else _read_table(path).copy()
     missing = sorted(GAP_TASK_REQUIRED_COLUMNS - set(tasks.columns))
     if missing:
         raise ValueError(f"missing required gap-task columns: {', '.join(missing)}")
@@ -452,9 +452,9 @@ def _write_validation_outputs(
 
 
 def validate_gap_results(
-    path: str | Path,
+    path: str | Path | pd.DataFrame,
     *,
-    tasks_path: str | Path | None = None,
+    tasks_path: str | Path | pd.DataFrame | None = None,
     method_metadata_path: str | Path | None = None,
     output_path: str | Path | None = None,
     rejected_path: str | Path | None = None,
@@ -467,7 +467,9 @@ def validate_gap_results(
     Rejected rows are excluded from the returned normalized frame and summarized
     in ``frame.attrs['validation_report']``.
     """
-    raw = _normalise_result_columns(_read_table(path))
+    raw = _normalise_result_columns(
+        path.copy() if isinstance(path, pd.DataFrame) else _read_table(path)
+    )
     metadata, metadata_hash = _load_method_metadata(method_metadata_path)
     metadata_method = (
         _text(metadata.get("method", metadata.get("method_id"))) if metadata is not None else ""
@@ -623,8 +625,8 @@ def validate_gap_results(
 
     report = {
         "schema_version": GAP_SCHEMA_VERSION,
-        "results_file": str(path),
-        "tasks_file": str(tasks_path) if tasks_path is not None else None,
+        "results_file": str(path) if isinstance(path, (str, Path)) else None,
+        "tasks_file": str(tasks_path) if isinstance(tasks_path, (str, Path)) else None,
         "method_metadata_file": (
             str(method_metadata_path) if method_metadata_path is not None else None
         ),

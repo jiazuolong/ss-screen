@@ -49,15 +49,19 @@ def _find_vasprun(task_dir: Path) -> Path | None:
     return None
 
 
-def _parse_vasprun(path: Path) -> ParsedVaspGap:
+def _parse_vasprun(path: Path, *, run: Any = None) -> ParsedVaspGap:
     try:
-        run = Vasprun(
-            path,
-            parse_dos=False,
-            parse_eigen=True,
-            parse_projected_eigen=False,
-            parse_potcar_file=False,
-            exception_on_bad_xml=False,
+        run = (
+            run
+            if run is not None
+            else Vasprun(
+                path,
+                parse_dos=False,
+                parse_eigen=True,
+                parse_projected_eigen=False,
+                parse_potcar_file=False,
+                exception_on_bad_xml=False,
+            )
         )
     except Exception as exc:
         return ParsedVaspGap(status="failed", error=f"vasprun_parse_error: {exc}")
@@ -121,7 +125,7 @@ def _result_record(
         "status": parsed.status,
         "error": parsed.error,
         "structure_sha256": str(task["structure_sha256"]),
-        "settings_sha256": settings_sha256,
+        "settings_sha256": settings_sha256 or str(task.get("settings_sha256", "") or ""),
         "backend": "VASP",
         "backend_version": parsed.backend_version,
         "completed_at": _completed_at(vasprun_path) if vasprun_path is not None else "",
@@ -163,6 +167,10 @@ def collect_vasp_gap_results(
                 "method metadata does not match task methods: "
                 f"metadata={metadata_method}, tasks={', '.join(sorted(task_methods))}"
             )
+        if "settings_sha256" in tasks:
+            expected = set(tasks["settings_sha256"].astype(str)) - {""}
+            if expected - {settings_sha256}:
+                raise ValueError("method metadata settings do not match the task settings_sha256")
 
     known_task_ids = set(tasks["task_id"].astype(str))
     requested = list(dict.fromkeys(task_ids))

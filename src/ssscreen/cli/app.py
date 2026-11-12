@@ -30,6 +30,7 @@ import pandas as pd
 
 from .. import __version__
 from ..config import (
+    GAP_EXPORT_MAX_ATOMS,
     CompetingPhaseSettings,
     MLPRelaxationSettings,
     PhononSettings,
@@ -48,8 +49,9 @@ from ..pair.envmatch import find_unique_envs, group_similar_structures
 from ..pair.filters import apply_element_exclusion, apply_size_gate, has_gap_diversity
 from ..pair.grouping import (
     attach_band_gaps,
+    candidate_structures,
     group_by_composition_template,
-    screen_composition_candidates,
+    screen_composition_batches,
 )
 from ..pair.pairing import enumerate_pairs, pairs_to_dataframe
 
@@ -385,6 +387,11 @@ def valence_filter_cmd(
 )
 @click.option("--manifest", "manifest_path", type=click.Path(path_type=Path))
 @click.option("--index", "index_path", type=click.Path(path_type=Path))
+@click.option(
+    "--stop-file",
+    type=click.Path(path_type=Path),
+    help="Stop after the current structure when this file appears; save completed records.",
+)
 @click.option("--limit", type=int, help="Limit number of DataFrame rows to condense.")
 @click.option("--overwrite", is_flag=True, default=False, help="Overwrite existing outputs.")
 @click.option(
@@ -404,12 +411,14 @@ def condense_cmd(
     limit: int | None,
     overwrite: bool,
     stop_on_error: bool,
+    stop_file: Path | None,
 ) -> None:
     """Build robocrys condensed-structure JSON files."""
     from ..data.condense import condense_dataframe, condense_paths
 
     if bool(inputs) == bool(df_path):
         raise click.UsageError("Provide exactly one of --input or --df.")
+    control = {"stop_file": stop_file} if stop_file is not None else {}
     try:
         if df_path:
             summary = condense_dataframe(
@@ -422,6 +431,7 @@ def condense_cmd(
                 manifest_path=manifest_path,
                 index_path=index_path,
                 continue_on_error=not stop_on_error,
+                **control,
             )
         else:
             summary = condense_paths(
@@ -431,14 +441,19 @@ def condense_cmd(
                 manifest_path=manifest_path,
                 index_path=index_path,
                 continue_on_error=not stop_on_error,
+                **control,
             )
     except ImportError as exc:
         raise click.ClickException(str(exc)) from exc
 
     click.echo(
         "Condense summary: "
-        f"written={summary.written} skipped={summary.skipped} failed={summary.failed}"
+        f"written={summary.written} skipped={summary.skipped} failed={summary.failed} "
+        f"stopped={summary.stopped} pending={summary.pending}"
     )
+    if summary.stopped:
+        click.echo("Stopped; completed descriptions and manifest/index have been preserved.")
+        raise click.exceptions.Exit(130)
 
 
 @cli.command("condense-index")
@@ -561,7 +576,12 @@ def structure_match_cmd(
 @click.option("--results-template", type=click.Path(path_type=Path))
 @click.option("--method-metadata-template", type=click.Path(path_type=Path))
 @click.option("--structure-column", "structure_col", default="structure", show_default=True)
-@click.option("--max-natoms", type=int, default=30, show_default=True)
+@click.option("--max-natoms", type=int, default=GAP_EXPORT_MAX_ATOMS, show_default=True)
+@click.option(
+    "--bundle",
+    is_flag=True,
+    help="Write one portable ZIP with all structures, tasks and templates.",
+)
 @click.option("--output", type=click.Path(path_type=Path), required=True)
 def gap_export_cmd(
     groups_path: Path,
@@ -573,9 +593,32 @@ def gap_export_cmd(
     method_metadata_template: Path | None,
     structure_col: str,
     max_natoms: int | None,
+    bundle: bool,
     output: Path,
 ) -> None:
     """Export matched group members for external high-level gap calculations."""
+    if bundle:
+        from ..pair.gap_bundle import export_gap_bundle
+
+        if any((structure_dir, results_template, method_metadata_template)) or method != "external":
+            raise click.UsageError(
+                "--bundle manages its own internal paths and pending method; use --output FILE.zip."
+            )
+        try:
+            report = export_gap_bundle(
+                groups_path,
+                dataset_path,
+                output,
+                max_natoms=max_natoms,
+                structure_col=structure_col,
+            )
+        except (OSError, ValueError) as exc:
+            raise click.ClickException(str(exc)) from exc
+        click.echo(
+            f"Wrote gap input ZIP: {output}; tasks={report['task_count']}, skipped={report['skipped_count']}"
+        )
+        return
+
     from ..pair.gap_export import export_gap_candidates
 
     exported = export_gap_candidates(
@@ -598,13 +641,26 @@ def gap_export_cmd(
     "--tasks",
     "tasks_path",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
-    required=True,
+    help="Legacy explicit task table; the GUI uses its project's --task-source automatically.",
+)
+@click.option(
+    "--task-source",
+    "task_sources",
+    multiple=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Project export ZIP or registered task CSV used for result collection.",
 )
 @click.option(
     "--results-dir",
     type=click.Path(exists=True, file_okay=False, path_type=Path),
-    required=True,
     help="Directory containing one task_id/vasprun.xml subdirectory per VASP task.",
+)
+@click.option("--historical-library", is_flag=True, help="Match CSV records to the current export by material and crystal structure.")
+@click.option("--library-method", default="", help="Select a historical calculation method.")
+@click.option(
+    "--results-csv",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Prepared gap-result CSV; choose this or --results-dir.",
 )
 @click.option(
     "--method-metadata",
@@ -626,28 +682,78 @@ def gap_export_cmd(
     help="JSON report path; defaults beside OUTPUT.",
 )
 def gap_collect_vasp_cmd(
-    tasks_path: Path,
-    results_dir: Path,
+    historical_library: bool,
+    library_method: str,
+    tasks_path: Path | None,
+    task_sources: tuple[Path, ...],
+    results_dir: Path | None,
+    results_csv: Path | None,
     method_metadata_path: Path | None,
     task_ids: tuple[str, ...],
     output_path: Path,
     report_path: Path | None,
 ) -> None:
-    """Collect batch VASP vasprun.xml files into the external gap-result schema."""
+    """Collect VASP XML files or import a prepared gap-result CSV."""
     from ..pair.gap_collect_vasp import collect_vasp_gap_results
 
-    results, report = collect_vasp_gap_results(
-        tasks_path=tasks_path,
-        results_dir=results_dir,
-        output_path=output_path,
-        report_path=report_path,
-        method_metadata_path=method_metadata_path,
-        task_ids=task_ids,
+    if (historical_library and results_csv is None) or (library_method and not historical_library):
+        raise click.UsageError("Historical matching requires --historical-library and --results-csv.")
+    if (results_dir is None) == (results_csv is None):
+        raise click.UsageError("Choose exactly one of --results-dir or --results-csv.")
+    if results_csv is not None:
+        from ..pair.gap_collect_csv import collect_gap_csv
+
+        if not task_sources or tasks_path or method_metadata_path or task_ids:
+            raise click.UsageError(
+                "--results-csv requires project --task-source without legacy task/method options."
+            )
+        try:
+            results, report = collect_gap_csv(
+                task_sources=task_sources,
+                results_csv=results_csv,
+                library_method=library_method if historical_library else None,
+                output_path=output_path,
+                report_path=report_path,
+            )
+        except (OSError, ValueError) as exc:
+            raise click.ClickException(str(exc)) from exc
+    elif task_sources:
+        from ..pair.gap_collect_folder import collect_vasp_gap_folder
+
+        if tasks_path or method_metadata_path or task_ids:
+            raise click.UsageError(
+                "--task-source uses the complete project batch and XML settings; do not combine it with legacy task/method options."
+            )
+        try:
+            results, report = collect_vasp_gap_folder(
+                task_sources=task_sources,
+                results_dir=results_dir,
+                output_path=output_path,
+                report_path=report_path,
+            )
+        except (OSError, ValueError) as exc:
+            raise click.ClickException(str(exc)) from exc
+    else:
+        if tasks_path is None:
+            raise click.UsageError(
+                "Provide --task-source for folder collection or legacy --tasks."
+            )
+        results, report = collect_vasp_gap_results(
+            tasks_path=tasks_path,
+            results_dir=results_dir,
+            output_path=output_path,
+            report_path=report_path,
+            method_metadata_path=method_metadata_path,
+            task_ids=task_ids,
+        )
+    statuses = ", ".join(
+        f"{status}={count}" for status, count in report["status_counts"].items()
     )
-    statuses = ", ".join(f"{status}={count}" for status, count in report["status_counts"].items())
     suffix = f" ({statuses})" if statuses else ""
+    operation = "Imported CSV for" if results_csv is not None else "Scanned"
+    task_label = "tasks" if results_csv is not None else "VASP tasks"
     click.echo(
-        f"Scanned {report['selected_task_count']} VASP tasks and wrote {len(results)} rows "
+        f"{operation} {report['selected_task_count']} {task_label} and wrote {len(results)} rows "
         f"to {output_path}; report={report_path or output_path.with_name(f'{output_path.stem}.collection-report.json')}"
         f"{suffix}"
     )
@@ -756,6 +862,27 @@ def gap_compare_cmd(
 @cli.group("stability")
 def stability_cmd() -> None:
     """Generate optional preliminary stability-screening inputs."""
+
+
+@stability_cmd.command("match-library")
+@click.option("--kind", type=click.Choice(["phonon","phase"]), required=True)
+@click.option("--library", type=click.Path(exists=True,path_type=Path), required=True)
+@click.option("--relaxation", type=click.Path(exists=True,path_type=Path), required=True)
+@click.option("--pairs", type=click.Path(exists=True,path_type=Path), required=True)
+@click.option("--database", type=click.Path(exists=True,path_type=Path))
+@click.option("--output", type=click.Path(path_type=Path), required=True)
+def stability_match_library(kind, library, relaxation, pairs, database, output):
+    """Match a portable stability library to this project's relaxed alloys."""
+    from ..stability.result_library import match_library
+    try:
+        rows, backup = match_library(kind,library,relaxation,pairs,output,database)
+    except (OSError,ValueError,KeyError,TypeError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    matched = sum(row["library_match"]=="matched" for row in rows)
+    usable = sum(row["status"]=="success" for row in rows)
+    click.echo(f"本批 {len(rows)} 个合金，历史记录匹配 {matched}，成功 {usable}，未匹配或待核验 {len(rows)-matched}。输出 {output}")
+    if backup:
+        click.echo(f"已备份之前的结果：{backup}")
 
 
 @stability_cmd.command("sqs-generate")
@@ -1964,7 +2091,14 @@ def recommend_cmd(
     type=click.Path(exists=True, path_type=Path),
     help="Optional JSON list of valence-valid IDs (from `valence-filter`).",
 )
-@click.option("--nelems", type=int, default=2, show_default=True)
+@click.option(
+    "--nelems",
+    type=click.IntRange(2, 3),
+    multiple=True,
+    default=(2,),
+    show_default=True,
+    help="Element count: 2 or 3; repeat to screen both in one run.",
+)
 @click.option("--max-bandgap", type=float, default=1.0, show_default=True)
 @click.option("--max-e-hull", "max_e_hull", type=float, default=0.0, show_default=True)
 @click.option("--min-group-size", type=int, default=2, show_default=True)
@@ -1989,10 +2123,15 @@ def recommend_cmd(
     type=click.Path(path_type=Path),
     help="Optional JSON screening summary.",
 )
+@click.option(
+    "--structures-output",
+    type=click.Path(path_type=Path),
+    help="Pickled candidate DataFrame for Stage 03, deduplicated by material ID.",
+)
 def composition_screen_cmd(
     df_paths: tuple[Path, ...],
     valence_ids: Path | None,
-    nelems: int,
+    nelems: tuple[int, ...],
     max_bandgap: float,
     max_e_hull: float,
     min_group_size: int,
@@ -2000,29 +2139,45 @@ def composition_screen_cmd(
     excluded_elements: tuple[str, ...],
     output: Path,
     summary: Path | None,
+    structures_output: Path | None,
 ) -> None:
     """Screen composition-template candidates before structure matching."""
     from monty.serialization import dumpfn, loadfn
 
+    destinations = [path.resolve() for path in (output, summary, structures_output) if path]
+    sources = {path.resolve() for path in (*df_paths, valence_ids) if path}
+    if len(set(destinations)) != len(destinations) or sources.intersection(destinations):
+        raise click.ClickException("Output paths must be distinct and must not overwrite inputs.")
     frames = [pd.read_pickle(path) for path in df_paths]
     df = pd.concat(frames, axis=0)
     if valence_ids:
         valid = loadfn(str(valence_ids))
         df = df.loc[valid]
 
-    thresholds = Thresholds.default(nelems).with_nelems(nelems)
+    thresholds = Thresholds.default(nelems[0])
     excluded = (
         coerce_excluded(excluded_elements) if excluded_elements else thresholds.excluded_elements
     )
-    candidates, report = screen_composition_candidates(
-        df,
-        nelems=nelems,
-        max_bandgap=max_bandgap,
-        max_e_hull=max_e_hull,
-        excluded_elements=excluded,
-        min_group_size=min_group_size,
-        min_x_elements=min_x_elements,
-    )
+
+    try:
+        candidates, report = screen_composition_batches(
+            df,
+            element_counts=nelems,
+            max_bandgap=max_bandgap,
+            max_e_hull=max_e_hull,
+            excluded_elements=excluded,
+            min_group_size=min_group_size,
+            min_x_elements=min_x_elements,
+        )
+        structures = candidate_structures(df, candidates) if structures_output else None
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    report["input_files"] = [str(path) for path in df_paths]
+    report["valence_ids"] = str(valence_ids) if valence_ids else None
+    if structures_output:
+        report["structures_output"] = str(structures_output)
+        structures_output.parent.mkdir(parents=True, exist_ok=True)
+        structures.to_pickle(structures_output)
     output.parent.mkdir(parents=True, exist_ok=True)
     candidates.to_csv(output, index=False)
     if summary:
@@ -2033,6 +2188,8 @@ def composition_screen_cmd(
         f"Wrote {len(candidates)} composition-candidate rows "
         f"across {report['template_count']} templates to {output}"
     )
+    if structures_output:
+        click.echo(f"Wrote {len(structures)} unique candidate structures to {structures_output}")
 
 
 # ---------------------------------------------------------------------------
@@ -2299,6 +2456,49 @@ def pair_cmd(
     pairs_df = pairs_to_dataframe(all_pairs)
     write_pairs_csv(pairs_df, output)
     click.echo(f"Wrote {len(pairs_df)} pairs to {output}")
+
+
+@cli.command("mp-reproduce")
+@click.option("--mp-zip", required=True, type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--mbj-bundle", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--output-dir", required=True, type=click.Path(path_type=Path))
+@click.option("--workers", default=4, show_default=True, type=click.IntRange(min=1))
+@click.option(
+    "--descriptor-cache",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Explicitly reuse verified descriptors; otherwise calculate them afresh.",
+)
+def mp_reproduce_cmd(
+    mp_zip: Path,
+    mbj_bundle: Path,
+    output_dir: Path,
+    workers: int,
+    descriptor_cache: Path | None,
+) -> None:
+    """Reproduce the dated MP ZIP -> 318-pair workflow (Linux/WSL Python 3.11).
+
+    Requires the separately supplied frozen mBJ bundle. Recomputes composition
+    candidates and groups from the database; never launches DFT or MACE.
+    """
+    import json
+
+    from ..mp_reproduction import reproduce_mp_zip
+
+    try:
+        result = reproduce_mp_zip(
+            mp_zip, mbj_bundle, output_dir, workers=workers, descriptor_cache=descriptor_cache
+        )
+    except (ValueError, ImportError, FileNotFoundError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+# Stage 13 geometry evaluator is opt-in and does not change legacy CLI behavior.
+from ..geometry_cli import main as geometry_evaluate_cmd
+cli.add_command(geometry_evaluate_cmd)
+
+from ..pair.wavelength import main as pair_wavelength_cmd
+cli.add_command(pair_wavelength_cmd)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ import re
 from PySide6.QtWidgets import (
     QComboBox,
     QFormLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QPlainTextEdit,
@@ -68,9 +69,16 @@ def adapt_font_layout(root: QWidget, points: int) -> None:
 
         if isinstance(widget, QTableWidget):
             row_height = max(28, widget.fontMetrics().height() + 14)
-            widget.verticalHeader().setDefaultSectionSize(row_height)
-            for row in range(widget.rowCount()):
-                widget.setRowHeight(row, row_height)
+            header = widget.verticalHeader()
+            header.setDefaultSectionSize(row_height)
+            # ResizeToContents already follows font metrics. Forcing each row
+            # repeatedly relays out the entire imported candidate table.
+            if (
+                widget.rowCount() < 100
+                and header.sectionResizeMode(0) != QHeaderView.ResizeToContents
+            ):
+                for row in range(widget.rowCount()):
+                    widget.setRowHeight(row, row_height)
             widths = widget.property("fontColumnBaseline")
             if widths is None:
                 widths = [widget.columnWidth(column) for column in range(widget.columnCount())]

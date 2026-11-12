@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
+import pytest
 from click.testing import CliRunner
 from monty.serialization import loadfn
 from pymatgen.core import Composition, Lattice, Structure
@@ -198,6 +199,37 @@ def test_condense_command_invokes_dataframe_archive_mode(monkeypatch, tmp_path):
     assert "skipped=1" in result.output
 
 
+def test_condense_cli_stop_file_exits_without_claiming_completion(monkeypatch, tmp_path):
+    from ssscreen.data.condense import CondenseSummary
+
+    source = tmp_path / "source.df"
+    source.touch()
+    stop = tmp_path / "stop.request"
+    calls = []
+
+    def stopped(**kwargs):
+        calls.append(kwargs)
+        return CondenseSummary(written=1, failed=1, pending=3, stopped=True)
+
+    monkeypatch.setattr("ssscreen.data.condense.condense_dataframe", stopped)
+    result = CliRunner().invoke(
+        cli,
+        [
+            "condense",
+            "--df",
+            str(source),
+            "--output-dir",
+            str(tmp_path / "condensed"),
+            "--stop-file",
+            str(stop),
+        ],
+    )
+    assert result.exit_code == 130
+    assert calls[0]["stop_file"] == stop
+    assert "stopped=True pending=3" in result.output
+    assert "preserved" in result.output
+
+
 def test_condense_index_command_writes_archive_index(monkeypatch, tmp_path):
     runner = CliRunner()
     condensed_dir = tmp_path / "condensed"
@@ -316,6 +348,136 @@ def test_composition_screen_writes_candidate_table_and_summary(tmp_path):
     assert report["selected_rows"] == 3
     assert report["template_count"] == 2
     assert report["candidate_rows"] == 4
+
+
+def test_composition_multi_select_exports_original_unique_structures(tmp_path):
+    df = _screening_df(
+        [
+            ("mp-1", "CaS", 0.0, 0.0),
+            ("mp-2", "CaSe", 0.3, 0.0),
+            ("mp-3", "SrS", 0.4, 0.0),
+            ("mp-4", "CaSnO", 0.1, 0.0),
+            ("mp-5", "SrSnO", 0.3, 0.0),
+            ("mp-6", "BaSnO", 0.2, 0.1),
+            ("mp-7", "CaTe", 1.0, 0.0),
+        ]
+    )
+    source, output = tmp_path / "mp.df", tmp_path / "candidates.csv"
+    summary, structures = tmp_path / "summary.json", tmp_path / "candidates.df"
+    df.to_pickle(source)
+    result = CliRunner().invoke(
+        cli,
+        [
+            "composition-screen",
+            "--df",
+            str(source),
+            "--nelems",
+            "2",
+            "--nelems",
+            "3",
+            "--nelems",
+            "2",
+            "--output",
+            str(output),
+            "--summary",
+            str(summary),
+            "--structures-output",
+            str(structures),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    table, exported, report = pd.read_csv(output), pd.read_pickle(structures), loadfn(summary)
+    assert len(table) == 6  # CaS participates in two templates.
+    assert set(table["nelems"]) == {2, 3}
+    assert set(exported.index) == {"mp-1", "mp-2", "mp-3", "mp-4", "mp-5"}
+    assert exported.index.is_unique and exported.index.name == df.index.name
+    pd.testing.assert_frame_equal(exported, df.loc[exported.index])
+    assert [s.as_dict() for s in exported.structure] == [
+        s.as_dict() for s in df.loc[exported.index].structure
+    ]
+    assert report["input_rows"] == 7
+    assert report["nelems"] == [2, 3]
+    assert report["unique_candidate_materials"] == 5
+    assert report["by_nelems"]["2"]["candidate_rows"] == 4
+    assert report["by_nelems"]["3"]["candidate_rows"] == 2
+
+
+@pytest.mark.parametrize(
+    "problem", ["duplicate_ids", "missing_structure", "same_outputs", "overwrite_input"]
+)
+def test_composition_export_rejects_ambiguous_or_destructive_inputs(tmp_path, problem):
+    df = _screening_df([("mp-1", "CaS", 0.0, 0.0), ("mp-2", "CaSe", 0.3, 0.0)])
+    if problem == "duplicate_ids":
+        df = pd.concat([df, df])
+    if problem == "missing_structure":
+        df = df.drop(columns=["structure"])
+    source, output, structures = tmp_path / "source.df", tmp_path / "out.csv", tmp_path / "out.df"
+    df.to_pickle(source)
+    original = source.read_bytes()
+    if problem == "same_outputs":
+        structures = output
+    if problem == "overwrite_input":
+        structures = source
+    result = CliRunner().invoke(
+        cli,
+        [
+            "composition-screen",
+            "--df",
+            str(source),
+            "--output",
+            str(output),
+            "--structures-output",
+            str(structures),
+        ],
+    )
+    assert result.exit_code != 0
+    assert not output.exists()
+    assert source.read_bytes() == original
+
+
+@pytest.mark.parametrize("count", ["1", "4", "5", "2.5"])
+def test_composition_only_binary_or_ternary(tmp_path, count):
+    source = tmp_path / "source.df"
+    source.touch()
+    result = CliRunner().invoke(
+        cli,
+        [
+            "composition-screen",
+            "--df",
+            str(source),
+            "--nelems",
+            count,
+            "--output",
+            str(tmp_path / "out.csv"),
+        ],
+    )
+    assert result.exit_code == 2
+
+
+def test_composition_empty_selection_writes_empty_structure_table(tmp_path):
+    df = _screening_df([("mp-1", "CaS", 1.2, 0.0), ("mp-2", "CaSe", 1.3, 0.0)])
+    source, structures = tmp_path / "source.df", tmp_path / "candidates.df"
+    df.to_pickle(source)
+    result = CliRunner().invoke(
+        cli,
+        [
+            "composition-screen",
+            "--df",
+            str(source),
+            "--nelems",
+            "2",
+            "--nelems",
+            "3",
+            "--output",
+            str(tmp_path / "out.csv"),
+            "--structures-output",
+            str(structures),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    exported = pd.read_pickle(structures)
+    assert exported.empty
+    assert list(exported.columns) == list(df.columns)
 
 
 def test_dataset_mp_command_defaults_to_offline_loader(monkeypatch, tmp_path):

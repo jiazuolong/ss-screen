@@ -69,6 +69,10 @@ MP_API_CHUNK_SIZE = 500
 MP_API_PAGE_RETRIES = 3
 MP_API_RETRY_BACKOFF_SECONDS = 2.0
 
+# Preserve the existing Stage 05 export scope when the GUI bundles its outputs.
+GAP_EXPORT_MAX_ATOMS = 30
+GAP_PENDING_METHOD = "external-method-pending-v1"
+
 
 # ---------------------------------------------------------------------------
 # Permutation indices for composition-template grouping

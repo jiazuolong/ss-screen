@@ -10,22 +10,25 @@ GUI.
 
 from __future__ import annotations
 
+import copy
 import csv
 import hashlib
 import json
 import os
 import shlex
 import sys
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path, PureWindowsPath
 from typing import Any
+from uuid import uuid4
 
 import click
 
 try:
     from PySide6.QtCore import QProcess, QProcessEnvironment, QSettings, QSize, Qt, QUrl, Signal
-    from PySide6.QtGui import QActionGroup, QDesktopServices, QFont, QTextCursor
+    from PySide6.QtGui import QActionGroup, QDesktopServices, QFont, QFontDatabase, QTextCursor
     from PySide6.QtWidgets import (
         QAbstractItemView,
         QApplication,
@@ -59,6 +62,7 @@ try:
         QTreeView,
         QTreeWidget,
         QTreeWidgetItem,
+        QTreeWidgetItemIterator,
         QVBoxLayout,
         QWidget,
     )
@@ -83,8 +87,10 @@ if __package__ in {None, ""}:
         font_size,
         font_stylesheet,
     )
-    from ssscreen.gui.icons import app_icon, stage_icon
     from ssscreen.gui.detector_page import DetectorAssessmentPage
+    from ssscreen.gui.gap_bundle_page import GapBundlePage
+    from ssscreen.gui.gap_collect_page import GapCollectPage
+    from ssscreen.gui.icons import app_icon, stage_icon
     from ssscreen.gui.metadata import (
         COMMANDS,
         PATH_PRESETS,
@@ -97,11 +103,26 @@ if __package__ in {None, ""}:
         extract_project_file,
         inspect_project_file,
     )
+    from ssscreen.gui.relax_page import RelaxPage
+    from ssscreen.gui.relax_results import manifest_rows
+    from ssscreen.gui.sqs_page import SqsPage
+    from ssscreen.gui.sqs_results import pair_count
+    from ssscreen.gui.stability_page import STABILITY_PATHS, StabilityPage
     from ssscreen.gui.visualization import (
         MatterVizView,
         PhaseResultsPage,
         PhononResultsPage,
         StructureResultsPage,
+    )
+    from ssscreen.gui.wavelength_page import WavelengthPairPage
+    from ssscreen.gui.workflow_project import (
+        WorkflowController,
+        apply_command_values,
+        capture_forms,
+        imported_artifact,
+        mp_output_paths,
+        read_project,
+        restore_forms,
     )
 else:
     from .. import __version__
@@ -115,15 +136,32 @@ else:
         font_size,
         font_stylesheet,
     )
-    from .icons import app_icon, stage_icon
     from .detector_page import DetectorAssessmentPage
+    from .gap_bundle_page import GapBundlePage
+    from .gap_collect_page import GapCollectPage
+    from .icons import app_icon, stage_icon
     from .metadata import COMMANDS, PATH_PRESETS, STAGES, CommandPresentation, option_label_zh
     from .project_file import create_project_file, extract_project_file, inspect_project_file
+    from .relax_page import RelaxPage
+    from .relax_results import manifest_rows
+    from .sqs_page import SqsPage
+    from .sqs_results import pair_count
+    from .stability_page import STABILITY_PATHS, StabilityPage
     from .visualization import (
         MatterVizView,
         PhaseResultsPage,
         PhononResultsPage,
         StructureResultsPage,
+    )
+    from .wavelength_page import WavelengthPairPage
+    from .workflow_project import (
+        WorkflowController,
+        apply_command_values,
+        capture_forms,
+        imported_artifact,
+        mp_output_paths,
+        read_project,
+        restore_forms,
     )
 
 
@@ -183,7 +221,7 @@ def _resolve_project_path(project_root: Path, value: str) -> Path:
     text = _strip_gui_package_prefix(value.strip())
     path = Path(text).expanduser()
     if not path.is_absolute():
-        return project_root / path
+        return imported_artifact(project_root, text)
 
     try:
         relative = path.resolve().relative_to(project_root)
@@ -226,7 +264,9 @@ class ValueEditor(QWidget):
                 or any(name.endswith(("-dir", "-dirs")) for name in option_names)
             )
         )
-        self._default = option.default
+        self._default = option.get_default(click.Context(click.Command("gui")))
+        if self._default is getattr(click.core, "UNSET", None):
+            self._default = None
         self._preset = preset
         self._mode = "text"
 
@@ -246,7 +286,7 @@ class ValueEditor(QWidget):
         if isinstance(option.type, click.Choice) and not option.multiple:
             self._mode = "choice"
             self.widget = QComboBox()
-            if option.default is None and not option.required:
+            if self._default is None and not option.required:
                 self.widget.addItem("")
             for choice in option.type.choices:
                 self.widget.addItem(str(choice))
@@ -296,9 +336,7 @@ class ValueEditor(QWidget):
     def _initial_value(self) -> Any:
         if self._preset is not None:
             return self._preset
-        if self.option.default is None:
-            return None
-        return self.option.default
+        return self._default
 
     def reset(self) -> None:
         """Restore Click default, falling back to a GUI path preset."""
@@ -397,7 +435,7 @@ class ValueEditor(QWidget):
         option = self.option
         if self._mode == "bool":
             value = self.widget.isChecked()
-            default = bool(option.default)
+            default = bool(self._default)
             if value == default:
                 return []
             if value:
@@ -531,6 +569,7 @@ class CommandPage(QWidget):
         copy_btn.clicked.connect(self.copy_command)
 
         run_btn = QPushButton("运行任务")
+        self.run_button = run_btn
         run_btn.setIcon(app_icon("run"))
         run_btn.setIconSize(QSize(16, 16))
         run_btn.setObjectName("primaryButton")
@@ -574,7 +613,19 @@ class CommandPage(QWidget):
             saved = saved[len(prefix):]
 
         try:
-            with self.command.make_context(
+            # Restore settings without requiring remote/WSL inputs to exist on
+            # Windows. The real CLI still performs its normal path validation.
+            restore_command = copy.copy(self.command)
+            restore_command.params = [copy.copy(p) for p in self.command.params]
+            for param in restore_command.params:
+                # Editors need CLI text, before callbacks convert e.g. "2,2,2"
+                # into a tuple that cannot be passed back to the same option.
+                param.callback = None
+                if isinstance(param.type, click.Path):
+                    param.type = copy.copy(param.type)
+                    param.type.exists = False
+                    param.type.resolve_path = False
+            with restore_command.make_context(
                 self.command.name
                 or self.presentation.command_path[-1],
                 saved,
@@ -699,7 +750,7 @@ class DatasetSourcePage(QWidget):
 
         subtitle = QLabel(
             "Materials Project 和 WBM 在这里作为外部材料数据源管理。"
-            "SS-Screen 获取或导入数据后，将其规范化为工程内的本地 DataFrame；"
+            "SS-Screen 获取或导入数据后，将其规范化为本地 DataFrame；"
             "后续组成模板筛选、结构描述和结构匹配使用这些本地数据。"
         )
         subtitle.setWordWrap(True)
@@ -784,6 +835,7 @@ class DatasetSourcePage(QWidget):
                 )
             if value:
                 edit.setText(self._display_path(Path(value)))
+                edit.textEdited.emit(edit.text())
 
         browse.clicked.connect(choose)
         row.addWidget(edit, 1)
@@ -819,11 +871,11 @@ class DatasetSourcePage(QWidget):
 
         source_type = QLabel("External materials database / 外部材料数据库")
         source_use = QLabel(
-            "用于获取初始材料结构与筛选所需数据库字段，获取后统一保存为项目内的 01_dataset/mp.df。"
+            "用于获取初始材料结构与筛选所需数据库字段；离线导入默认将输出保存到输入数据库所在目录。"
         )
         source_use.setWordWrap(True)
         source_flow = QLabel(
-            "Materials Project → SS-Screen 数据获取/规范化 → 01_dataset/mp.df → 组成模板筛选"
+            "Materials Project → SS-Screen 数据获取/规范化 → 输出栏中的 mp.df → 组成模板筛选"
         )
         source_flow.setWordWrap(True)
 
@@ -832,12 +884,21 @@ class DatasetSourcePage(QWidget):
         identity_form.addRow("数据流", source_flow)
         layout.addWidget(identity)
 
-        acquire = QGroupBox("Materials Project Acquisition / 数据获取")
-        form = QFormLayout(acquire)
+        columns = QHBoxLayout()
+        columns.setSpacing(16)
+        self.mp_input_box = QGroupBox("输入栏 / Inputs")
+        self.mp_input_box.setObjectName("mpInputColumn")
+        input_layout = QVBoxLayout(self.mp_input_box)
+        input_note = QLabel("提供已有的材料数据库，并设置本次读取的筛选条件。")
+        input_note.setWordWrap(True)
+        input_layout.addWidget(input_note)
+
+        form = QFormLayout()
         form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
         form.setHorizontalSpacing(12)
         form.setVerticalSpacing(8)
+        input_layout.addLayout(form)
 
         self.mp_backend = QComboBox()
         self.mp_backend.addItem("API / 在线接口", "api")
@@ -845,43 +906,68 @@ class DatasetSourcePage(QWidget):
         form.addRow("数据模式", self.mp_backend)
 
         offline_host, self.mp_offline_db = self._path_editor("")
-        form.addRow("离线数据库", offline_host)
+        form.addRow("输入数据库文件", offline_host)
 
         self.mp_max_e_hull = QLineEdit("0.01")
         self.mp_max_e_hull.setMaximumWidth(180)
         form.addRow("最大凸包距离 (eV/atom)", self.mp_max_e_hull)
 
+        api_note = QLabel("离线模式无需 API Key；在线模式请在右侧连接设置填写 MP API Key。")
+        api_note.setWordWrap(True)
+        api_note.setObjectName("optionHelp")
+        form.addRow("在线凭据", api_note)
+        input_layout.addStretch(1)
+        columns.addWidget(self.mp_input_box, 1)
+
+        self.mp_output_box = QGroupBox("输出栏 / Outputs")
+        self.mp_output_box.setObjectName("mpOutputColumn")
+        output_layout = QVBoxLayout(self.mp_output_box)
+        output_note = QLabel(
+            "以下文件由程序运行后生成。离线模式默认与输入数据库同目录；"
+            "显示的相对路径以当前工程目录为基准。"
+        )
+        output_note.setWordWrap(True)
+        output_layout.addWidget(output_note)
+        self.mp_output_follow_input = QCheckBox("输出位置跟随输入数据库目录")
+        self.mp_output_follow_input.setChecked(True)
+        self.mp_output_follow_input.setToolTip(
+            "更换输入数据库时自动更新两个输出路径。手动修改输出路径后取消跟随；勾选可恢复默认。"
+        )
+        output_layout.addWidget(self.mp_output_follow_input)
+        output_form = QFormLayout()
+        output_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        output_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        output_form.setHorizontalSpacing(12)
+        output_form.setVerticalSpacing(8)
+        output_layout.addLayout(output_form)
+
         host, self.mp_output = self._path_editor(
             "01_dataset/mp.df",
             save_file=True,
         )
-        form.addRow("本地标准化数据", host)
+        self.mp_output.setToolTip("输出文件：标准化材料数据，供后续组成模板筛选使用。")
+        output_form.addRow("标准化材料数据文件", host)
 
         host, self.mp_provenance = self._path_editor(
             "01_dataset/mp.df.provenance.json",
             save_file=True,
         )
-        form.addRow("Provenance / 来源记录", host)
+        self.mp_provenance.setToolTip("输出文件：记录数据库来源、筛选条件、数量和版本，供追溯核验。")
+        output_form.addRow("来源记录文件", host)
 
-        api_note = QLabel(
-            "API 模式下不在命令里保存密钥。请在右侧 Properties → Connection "
-            "填写 MP API Key"
-        )
-        api_note.setWordWrap(True)
-        api_note.setObjectName("optionHelp")
-        form.addRow("API Key", api_note)
-        layout.addWidget(acquire)
-
-        result = QGroupBox("Local Result / 本地结果")
+        result = QGroupBox("输出文件生成状态")
         result_form = QFormLayout(result)
         result_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.mp_status = QLabel("未生成")
         self.mp_size = QLabel("—")
         self.mp_provenance_status = QLabel("未生成")
-        result_form.addRow("mp.df", self.mp_status)
+        result_form.addRow("材料数据", self.mp_status)
         result_form.addRow("文件大小", self.mp_size)
-        result_form.addRow("Provenance", self.mp_provenance_status)
-        layout.addWidget(result)
+        result_form.addRow("来源记录", self.mp_provenance_status)
+        output_layout.addWidget(result)
+        output_layout.addStretch(1)
+        columns.addWidget(self.mp_output_box, 1)
+        layout.addLayout(columns)
 
         preview_label = QLabel("Command Preview / 命令预览")
         preview_label.setObjectName("sectionLabel")
@@ -894,14 +980,13 @@ class DatasetSourcePage(QWidget):
         layout.addWidget(self.mp_preview)
 
         actions = QHBoxLayout()
-        refresh = QPushButton("检查本地结果")
+        refresh = QPushButton("检查输出文件")
         refresh.clicked.connect(self.refresh_sources)
         copy = QPushButton("复制命令")
-        copy.clicked.connect(
-            lambda: QApplication.clipboard().setText(self.mp_preview.toPlainText())
-        )
+        copy.clicked.connect(lambda: QApplication.clipboard().setText(self.mp_preview.toPlainText()))
         run = QPushButton("获取 Materials Project 数据")
         run.setObjectName("primaryButton")
+        run.setToolTip("读取输入栏中的数据库，按筛选条件生成输出栏中的两个文件。")
         run.clicked.connect(self._run_mp)
         actions.addWidget(refresh)
         actions.addStretch(1)
@@ -911,6 +996,10 @@ class DatasetSourcePage(QWidget):
         layout.addStretch(1)
 
         self.mp_backend.currentIndexChanged.connect(self._mp_backend_changed)
+        self.mp_offline_db.textChanged.connect(self._sync_mp_output_paths)
+        self.mp_output_follow_input.toggled.connect(self._sync_mp_output_paths)
+        self.mp_output.textEdited.connect(self._mp_manual_output)
+        self.mp_provenance.textEdited.connect(self._mp_manual_output)
         for editor in (
             self.mp_offline_db,
             self.mp_max_e_hull,
@@ -925,7 +1014,22 @@ class DatasetSourcePage(QWidget):
     def _mp_backend_changed(self) -> None:
         offline = self.mp_backend.currentData() == "offline"
         self.mp_offline_db.setEnabled(offline)
+        self._sync_mp_output_paths()
         self._refresh_mp_preview()
+
+    def _mp_manual_output(self) -> None:
+        self.mp_output_follow_input.setChecked(False)
+
+    def _sync_mp_output_paths(self) -> None:
+        if getattr(self, "_restoring_mp_settings", False):
+            return
+        if self.mp_output_follow_input.isChecked():
+            database = self.mp_offline_db.text() if self.mp_backend.currentData() == "offline" else ""
+            output, provenance = mp_output_paths(self._project_root(), database)
+            self.mp_output.setText(output)
+            self.mp_provenance.setText(provenance)
+        self._refresh_mp_preview()
+        self.refresh_sources()
 
     def _mp_argv(self) -> list[str]:
         argv = [
@@ -1430,8 +1534,7 @@ class CompositionScreenPage(QWidget):
     """Engineering GUI for composition template screening.
 
     This page maps directly to ``ss-screen composition-screen`` while treating
-    the two output files as persistent project results:
-    ``composition_candidates.csv`` and ``composition_summary.json``.
+    the candidate CSV, screening summary and deduplicated structures as results.
     """
 
     run_requested = Signal(list, str)
@@ -1452,7 +1555,7 @@ class CompositionScreenPage(QWidget):
         title.setObjectName("pageTitle")
         header.addWidget(title)
         header.addStretch(1)
-        badge = QLabel("流程第 1 步")
+        badge = QLabel("Stage 02")
         badge.setObjectName("stateBadge")
         header.addWidget(badge)
         root.addLayout(header)
@@ -1460,7 +1563,7 @@ class CompositionScreenPage(QWidget):
         subtitle = QLabel(
             "合并一个或多个规范化材料 DataFrame，可选使用价态过滤结果，"
             "再按照元素数、初筛带隙、凸包距离和组成模板条件筛选候选材料。"
-            "本阶段的两个核心输出是候选材料表和筛选统计。"
+            "输出候选材料表、筛选统计，以及供 03 使用的候选结构 candidates.df。"
         )
         subtitle.setWordWrap(True)
         subtitle.setObjectName("pageDescription")
@@ -1477,11 +1580,8 @@ class CompositionScreenPage(QWidget):
         boundary_layout = QVBoxLayout(boundary)
         boundary_layout.setContentsMargins(8, 8, 8, 8)
         text = QLabel(
-            "输出 1：Composition Candidates / 候选材料表 → "
-            "02_composition/composition_candidates.csv；"
-            "输出 2：Screening Summary / 筛选统计 → "
-            "02_composition/composition_summary.json。"
-            "候选表将作为后续结构匹配的 candidates 输入。"
+            "候选材料表 CSV 用于 04 结构匹配；筛选统计 JSON 记录各元素数的结果；"
+            "候选结构 candidates.df 按材料 ID 去重、保留原结构，默认传给 03 批量生成结构描述。"
         )
         text.setWordWrap(True)
         text.setObjectName("optionHelp")
@@ -1563,7 +1663,11 @@ class CompositionScreenPage(QWidget):
         layout.setContentsMargins(6, 8, 6, 6)
         layout.setSpacing(7)
 
-        input_box = QGroupBox("Input DataFrames / 输入规范化数据")
+        input_box = QGroupBox("输入栏 / Inputs — 规范化数据")
+        columns = QHBoxLayout()
+        input_column = QVBoxLayout()
+        columns.addLayout(input_column, 1)
+        layout.addLayout(columns)
         input_layout = QVBoxLayout(input_box)
         input_layout.setContentsMargins(8, 10, 8, 8)
 
@@ -1622,7 +1726,7 @@ class CompositionScreenPage(QWidget):
         valence_layout.addWidget(valence_browse)
 
         input_layout.addWidget(valence_host)
-        layout.addWidget(input_box)
+        input_column.addWidget(input_box)
 
         rules_box = QGroupBox("Screening Rules / 筛选规则")
         rules = QFormLayout(rules_box)
@@ -1631,14 +1735,22 @@ class CompositionScreenPage(QWidget):
         rules.setHorizontalSpacing(12)
         rules.setVerticalSpacing(7)
 
-        self.nelems_edit = QLineEdit("2")
+        self.binary_enabled = QCheckBox("二元（2 种元素）")
+        self.ternary_enabled = QCheckBox("三元（3 种元素）")
+        self.binary_enabled.setChecked(True)
+        self.ternary_enabled.setChecked(True)
+        element_host = QWidget()
+        element_layout = QHBoxLayout(element_host)
+        element_layout.setContentsMargins(0, 0, 0, 0)
+        element_layout.addWidget(self.binary_enabled)
+        element_layout.addWidget(self.ternary_enabled)
+        element_layout.addStretch(1)
         self.max_bandgap_edit = QLineEdit("1.0")
         self.max_e_hull_edit = QLineEdit("0.01")
         self.min_group_size_edit = QLineEdit("2")
         self.min_x_elements_edit = QLineEdit("2")
 
         for edit in (
-            self.nelems_edit,
             self.max_bandgap_edit,
             self.max_e_hull_edit,
             self.min_group_size_edit,
@@ -1646,7 +1758,7 @@ class CompositionScreenPage(QWidget):
         ):
             edit.setMaximumWidth(180)
 
-        rules.addRow("元素数量", self.nelems_edit)
+        rules.addRow("元素数量（可多选）", element_host)
         rules.addRow("最大初筛带隙 (eV)", self.max_bandgap_edit)
         rules.addRow("最大凸包距离 (eV/atom)", self.max_e_hull_edit)
         rules.addRow("模板最少材料数", self.min_group_size_edit)
@@ -1659,9 +1771,9 @@ class CompositionScreenPage(QWidget):
         rules_note.setWordWrap(True)
         rules_note.setObjectName("optionHelp")
         rules.addRow("", rules_note)
-        layout.addWidget(rules_box)
+        input_column.addWidget(rules_box)
 
-        output_box = QGroupBox("Outputs / 输出")
+        output_box = QGroupBox("输出栏 / Outputs — 运行后生成")
         outputs = QFormLayout(output_box)
         outputs.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         outputs.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -1679,7 +1791,15 @@ class CompositionScreenPage(QWidget):
             save_file=True,
         )
         outputs.addRow("筛选统计", host)
-        layout.addWidget(output_box)
+        host, self.structures_output = self._path_editor(
+            "02_composition/candidates.df",
+            save_file=True,
+        )
+        outputs.addRow("候选结构（供 03 输入）", host)
+        note = QLabel("以上三个文件均由本步运行生成。候选结构按材料 ID 去重，供 03 直接读取。")
+        note.setWordWrap(True)
+        outputs.addRow(note)
+        columns.addWidget(output_box, 1)
 
         preview_label = QLabel("Command Preview / 命令预览")
         preview_label.setObjectName("sectionLabel")
@@ -1714,16 +1834,18 @@ class CompositionScreenPage(QWidget):
 
         for edit in (
             self.valence_edit,
-            self.nelems_edit,
             self.max_bandgap_edit,
             self.max_e_hull_edit,
             self.min_group_size_edit,
             self.min_x_elements_edit,
             self.candidates_output,
             self.summary_output,
+            self.structures_output,
         ):
             edit.textChanged.connect(self._refresh_preview)
         self.use_valence.toggled.connect(self._refresh_preview)
+        self.binary_enabled.toggled.connect(self._refresh_preview)
+        self.ternary_enabled.toggled.connect(self._refresh_preview)
 
         return _wrap_in_scroll_area(page, min_width=840, min_height=700)
 
@@ -1869,6 +1991,13 @@ class CompositionScreenPage(QWidget):
         self.valence_edit.setEnabled(self.use_valence.isChecked())
         self._refresh_preview()
 
+    def _element_counts(self) -> list[int]:
+        return [
+            count
+            for count, checkbox in ((2, self.binary_enabled), (3, self.ternary_enabled))
+            if checkbox.isChecked()
+        ]
+
     def _screen_argv(self) -> list[str]:
         argv = ["composition-screen"]
 
@@ -1881,10 +2010,10 @@ class CompositionScreenPage(QWidget):
         if self.use_valence.isChecked() and self.valence_edit.text().strip():
             argv.extend(["--valence-ids", self.valence_edit.text().strip()])
 
+        for count in self._element_counts():
+            argv.extend(["--nelems", str(count)])
         argv.extend(
             [
-                "--nelems",
-                self.nelems_edit.text().strip() or "2",
                 "--max-bandgap",
                 self.max_bandgap_edit.text().strip() or "1.0",
                 "--max-e-hull",
@@ -1897,28 +2026,35 @@ class CompositionScreenPage(QWidget):
                 self.candidates_output.text().strip().replace("\\", "/"),
                 "--summary",
                 self.summary_output.text().strip().replace("\\", "/"),
+                "--structures-output",
+                self.structures_output.text().strip().replace("\\", "/"),
             ]
         )
         return argv
 
     def _refresh_preview(self) -> None:
         if hasattr(self, "command_preview"):
+            if not self._element_counts():
+                self.command_preview.setPlainText("请至少勾选二元或三元。")
+                return
             self.command_preview.setPlainText(shlex.join(["ss-screen", *self._screen_argv()]))
 
     def _run_screen(self) -> None:
+        if not self._element_counts():
+            QMessageBox.warning(self, "筛选参数错误", "请至少勾选二元或三元。")
+            return
         if not self._check_required(
             [
                 ("规范化 DataFrame", ", ".join(self._dataframe_paths())),
                 ("候选材料表输出", self.candidates_output.text()),
                 ("筛选统计输出", self.summary_output.text()),
+                ("候选结构输出", self.structures_output.text()),
             ]
         ):
             return
 
         # Basic GUI-side type checks; final validation still belongs to Click.
         try:
-            if int(self.nelems_edit.text().strip()) < 1:
-                raise ValueError
             if int(self.min_group_size_edit.text().strip()) < 1:
                 raise ValueError
             if int(self.min_x_elements_edit.text().strip()) < 1:
@@ -1931,7 +2067,7 @@ class CompositionScreenPage(QWidget):
             QMessageBox.warning(
                 self,
                 "筛选参数错误",
-                "元素数、组大小和 X 元素数量必须为正整数；带隙和凸包距离必须为非负数字。",
+                "组大小和 X 元素数量必须为正整数；带隙和凸包距离必须为非负数字。",
             )
             return
 
@@ -1956,6 +2092,8 @@ class CompositionScreenPage(QWidget):
 
         self.candidates_file_state = QLabel("未生成")
         self.summary_file_state = QLabel("未生成")
+        self.structures_file_state = QLabel("未生成")
+        files_form.addRow("候选结构（供 03 输入）", self.structures_file_state)
         files_form.addRow(
             "Composition Candidates",
             self.candidates_file_state,
@@ -1974,11 +2112,13 @@ class CompositionScreenPage(QWidget):
         self.selected_rows_value = QLabel("—")
         self.template_count_value = QLabel("—")
         self.candidate_rows_value = QLabel("—")
+        self.unique_materials_value = QLabel("—")
 
         summary_form.addRow("输入材料数", self.input_rows_value)
         summary_form.addRow("通过基础筛选", self.selected_rows_value)
         summary_form.addRow("组成模板数", self.template_count_value)
         summary_form.addRow("候选材料记录", self.candidate_rows_value)
+        summary_form.addRow("去重候选结构数（供 03）", self.unique_materials_value)
         layout.addWidget(summary_box)
 
         condition_box = QGroupBox("Screening Conditions / 实际筛选条件")
@@ -2116,6 +2256,11 @@ class CompositionScreenPage(QWidget):
 
         candidate_path = self._resolve(self.candidates_output.text())
         summary_path = self._resolve(self.summary_output.text())
+        structures_path = self._resolve(self.structures_output.text())
+        self.structures_file_state.setText(
+            self._display_path(structures_path)
+            + (" · 已生成" if structures_path.is_file() else " · 未生成")
+        )
 
         self.candidates_file_state.setText(
             self._display_path(candidate_path)
@@ -2168,10 +2313,11 @@ class CompositionScreenPage(QWidget):
         self.selected_rows_value.setText(str(selected_rows))
         self.template_count_value.setText(str(template_count))
         self.candidate_rows_value.setText(str(candidate_rows))
+        self.unique_materials_value.setText(str(summary.get("unique_candidate_materials", "—")))
 
         # Show the actual recorded conditions when summary contains them;
         # otherwise show current GUI settings and mark no extra conclusions.
-        self.result_nelems.setText(str(summary.get("nelems", self.nelems_edit.text())))
+        self.result_nelems.setText(str(summary.get("nelems", self._element_counts())))
         self.result_max_bandgap.setText(
             str(
                 summary.get(
@@ -2340,6 +2486,8 @@ class StructureArchivePage(QWidget):
     """Engineering GUI for workflow Step 2: structure description archive."""
 
     run_requested = Signal(list, str)
+    stop_requested = Signal()
+    use_completed_requested = Signal()
 
     def __init__(self, project_provider, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -2354,7 +2502,7 @@ class StructureArchivePage(QWidget):
         title.setObjectName("pageTitle")
         header.addWidget(title)
         header.addStretch(1)
-        badge = QLabel("流程第 2 步")
+        badge = QLabel("Stage 03")
         badge.setObjectName("stateBadge")
         header.addWidget(badge)
         root.addLayout(header)
@@ -2366,6 +2514,18 @@ class StructureArchivePage(QWidget):
         subtitle.setWordWrap(True)
         subtitle.setObjectName("pageDescription")
         root.addWidget(subtitle)
+
+        controls = QHBoxLayout()
+        self.stop_button = QPushButton("停止计算（保留结果）")
+        self.stop_button.setEnabled(False)
+        self.stop_button.setToolTip("完成当前结构后停止，保存已完成描述及运行记录；再次运行可续算。")
+        self.stop_button.clicked.connect(self.stop_requested.emit)
+        self.use_completed_button = QPushButton("使用已完成结果进入 04")
+        self.use_completed_button.clicked.connect(self.use_completed_requested.emit)
+        controls.addWidget(self.stop_button)
+        controls.addWidget(self.use_completed_button)
+        controls.addStretch(1)
+        root.addLayout(controls)
 
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
@@ -2469,7 +2629,16 @@ class StructureArchivePage(QWidget):
         form.setHorizontalSpacing(12)
         form.setVerticalSpacing(7)
 
-        host, self.df_path = self._path_editor("01_dataset/local_structures.df")
+        self.df_follow_composition = QCheckBox("默认使用 02 输出的候选结构 candidates.df")
+        self.df_follow_composition.setChecked(True)
+        form.addRow("输入来源", self.df_follow_composition)
+        host, self.df_path = self._path_editor("02_composition/candidates.df")
+        self.df_path.setReadOnly(True)
+        host.findChild(QPushButton).setEnabled(False)
+        self.df_follow_composition.toggled.connect(self.df_path.setReadOnly)
+        self.df_follow_composition.toggled.connect(
+            lambda follow, host=host: host.findChild(QPushButton).setEnabled(not follow)
+        )
         form.addRow("DataFrame", host)
 
         self.structure_column = QLineEdit("structure")
@@ -2497,9 +2666,7 @@ class StructureArchivePage(QWidget):
 
         host, self.df_output_dir = self._path_editor("03_condensed/local", directory=True)
         out_form.addRow("结构描述目录", host)
-        host, self.df_manifest = self._path_editor(
-            "03_condensed/local_manifest.jsonl", save_file=True
-        )
+        host, self.df_manifest = self._path_editor("03_condensed/local_manifest.jsonl", save_file=True)
         out_form.addRow("Manifest", host)
         host, self.df_index = self._path_editor("03_condensed/local_index.csv", save_file=True)
         out_form.addRow("Index", host)
@@ -2889,12 +3056,16 @@ class StructureArchivePage(QWidget):
     def _find_archive_json(self) -> list[tuple[str, Path]]:
         base = self._project_root() / "03_condensed"
         result: list[tuple[str, Path]] = []
+        selected = self._resolve(self.archive_dir_edit.text())
+        if selected.is_dir():
+            result.extend(("LOCAL", path) for path in sorted(selected.glob("*.json")))
         for source in ("local", "mp", "user"):
             folder = base / source
             if not folder.exists():
                 continue
             for path in sorted(folder.glob("*.json")):
-                result.append((source.upper(), path))
+                if not any(existing == path for _, existing in result):
+                    result.append((source.upper(), path))
         return result
 
     def refresh_archive(self) -> None:
@@ -3004,7 +3175,7 @@ class StructureMatchPage(QWidget):
         title.setObjectName("pageTitle")
         header.addWidget(title)
         header.addStretch(1)
-        badge = QLabel("流程第 3 步")
+        badge = QLabel("Stage 04")
         badge.setObjectName("stateBadge")
         header.addWidget(badge)
         root.addLayout(header)
@@ -3112,6 +3283,16 @@ class StructureMatchPage(QWidget):
         input_layout = QVBoxLayout(input_box)
         input_layout.setContentsMargins(8, 10, 8, 8)
 
+        self.follow_stage03 = QCheckBox("默认使用 02 候选表和 03 已生成的结构描述")
+        self.follow_stage03.setChecked(True)
+        input_layout.addWidget(self.follow_stage03)
+        partial_note = QLabel(
+            "允许使用 03 的部分结果。仅匹配已生成且可读取的描述，"
+            "未生成的材料会记录为缺失；结果页显示覆盖率及是否为部分筛选。"
+        )
+        partial_note.setWordWrap(True)
+        input_layout.addWidget(partial_note)
+
         candidate_form = QFormLayout()
         candidate_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         candidate_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -3119,6 +3300,12 @@ class StructureMatchPage(QWidget):
         candidate_form.setVerticalSpacing(7)
 
         host, self.candidates_edit = self._path_editor("02_composition/composition_candidates.csv")
+        self.candidates_edit.setReadOnly(True)
+        host.findChild(QPushButton).setEnabled(False)
+        self.follow_stage03.toggled.connect(self.candidates_edit.setReadOnly)
+        self.follow_stage03.toggled.connect(
+            lambda follow, host=host: host.findChild(QPushButton).setEnabled(not follow)
+        )
         candidate_form.addRow("组成候选表", host)
 
         candidate_status_host = QWidget()
@@ -3141,9 +3328,7 @@ class StructureMatchPage(QWidget):
         input_layout.addWidget(archive_label)
 
         self.archive_table = QTableWidget(0, 4)
-        self.archive_table.setHorizontalHeaderLabels(
-            ["归档目录", "JSON 数量", "Validation", "状态"]
-        )
+        self.archive_table.setHorizontalHeaderLabels(["归档目录", "JSON 数量", "Validation", "状态"])
         self.archive_table.verticalHeader().setVisible(False)
         self.archive_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.archive_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -3162,6 +3347,11 @@ class StructureMatchPage(QWidget):
         remove_archive.clicked.connect(self._remove_archives)
         reset_archives = QPushButton("恢复默认")
         reset_archives.clicked.connect(self._reset_archives)
+        for button in (add_archive, remove_archive, reset_archives):
+            button.setEnabled(False)
+            self.follow_stage03.toggled.connect(
+                lambda follow, button=button: button.setEnabled(not follow)
+            )
         check_inputs = QPushButton("检查输入")
         check_inputs.clicked.connect(self.refresh_inputs)
         archive_actions.addWidget(add_archive)
@@ -3455,15 +3645,20 @@ class StructureMatchPage(QWidget):
         self.result_group_count = QLabel("0")
         self.result_grouped_members = QLabel("0")
         self.result_missing = QLabel("—")
+        self.result_missing_materials = QLabel("—")
         self.result_invalid = QLabel("—")
         self.result_min_x = QLabel("—")
+        self.result_scope = QLabel("尚未运行")
+        self.result_scope.setWordWrap(True)
+        summary_grid.addRow("本次数据覆盖", self.result_scope)
 
         summary_grid.addRow("候选记录", self.result_candidate_rows)
         summary_grid.addRow("组成模板", self.result_template_count)
         summary_grid.addRow("Structure Groups", self.result_group_count)
-        summary_grid.addRow("组内材料总数", self.result_grouped_members)
-        summary_grid.addRow("缺失结构描述", self.result_missing)
-        summary_grid.addRow("无效结构描述", self.result_invalid)
+        summary_grid.addRow("组内成员记录数（可重复）", self.result_grouped_members)
+        summary_grid.addRow("暂无描述的材料（去重）", self.result_missing_materials)
+        summary_grid.addRow("缺失描述（候选记录数）", self.result_missing)
+        summary_grid.addRow("无效描述（候选记录数）", self.result_invalid)
         summary_grid.addRow("min X elements", self.result_min_x)
         layout.addWidget(summary_box)
 
@@ -3615,6 +3810,14 @@ class StructureMatchPage(QWidget):
 
         summary = self._load_summary(summary_path)
 
+        if "candidate_materials" in summary:
+            scope = "部分结果" if summary.get("partial_run") else "描述覆盖完整"
+            self.result_scope.setText(
+                f"{scope}：{summary['available_materials']} / {summary['candidate_materials']} "
+                f"个材料有可用描述（{summary['description_coverage']:.1%}）"
+            )
+        else:
+            self.result_scope.setText("未记录覆盖率" if summary else "尚未运行")
         self.result_candidate_rows.setText(str(summary.get("candidate_rows", "—")))
         self.result_template_count.setText(str(summary.get("template_count", "—")))
         self.result_group_count.setText(str(summary.get("group_count", len(records))))
@@ -3627,6 +3830,7 @@ class StructureMatchPage(QWidget):
             )
         )
         self.result_missing.setText(str(summary.get("missing_descriptions", "—")))
+        self.result_missing_materials.setText(str(summary.get("missing_materials", "—")))
         self.result_invalid.setText(str(summary.get("invalid_descriptions", "—")))
         self.result_min_x.setText(str(summary.get("min_x_elements", "—")))
 
@@ -3759,6 +3963,7 @@ COMPOSITION_SCREEN_OBJECTS = (
     ("rules", "筛选规则"),
     ("candidates", "Composition Candidates / 候选材料表"),
     ("summary", "Screening Summary / 筛选统计"),
+    ("structures", "候选结构 / candidates.df（供 03 输入）"),
 )
 
 STRUCTURE_ARCHIVE_OBJECTS = (
@@ -3821,6 +4026,83 @@ def _compact_value(value: object, *, max_len: int = 96) -> str:
     return text[: max_len - 1] + "…"
 
 
+_RECOMMENDATION_LABELS_ZH = {
+    "promising": "优先验证",
+    "uncertain": "待确认",
+    "low-priority": "低优先级",
+    "stable": "稳定",
+    "unstable": "不稳定",
+    "metastable_within_cutoff": "阈值内亚稳态",
+    "uncertain_incomplete_competing_set": "待确认（竞争相不完整）",
+    "api": "在线接口",
+    "offline": "离线数据库",
+    "gap": "带隙",
+    "mixing": "混合焓",
+    "phonon": "声子",
+    "phase": "竞争相",
+    "defects": "缺陷",
+    "mlp": "机器学习势",
+    "a": "端元 A",
+    "b": "端元 B",
+    "missing": "缺失",
+    "failed": "失败",
+    "not_converged": "未收敛",
+    "missing_source": "缺少数据来源",
+    "ambiguous_records": "存在多条歧义记录",
+    "pair_method_conflict": "配对与带隙计算方法不一致",
+    "ambiguous_method": "计算方法存在歧义",
+    "missing_method": "缺少计算方法",
+    "value_mismatch": "数值不一致",
+    "directness_mismatch": "直接或间接带隙标记不一致",
+    "both_endmembers_indirect": "两个端元均为间接带隙",
+    "above_low_priority_threshold": "超过低优先级阈值",
+    "borderline": "处于边界范围",
+    "nac_not_applied": "未应用非解析修正",
+    "incomplete_competing_set": "竞争相集合不完整",
+    "offline_snapshot_scope": "仅覆盖离线数据库快照",
+    "unknown_signal": "未知判据",
+    "risky": "存在风险",
+    "model_sha256_mismatch": "模型校验值不一致",
+    "complete_or_revalidate_high_fidelity_endpoint_gaps": "补齐或重新验证高精度端元带隙",
+    "run_compatible_sqs_relaxation_and_mixing_enthalpy": "使用一致设置完成合金弛豫和混合焓计算",
+    "run_converged_phonon_screening": "完成收敛的声子筛查",
+    "complete_same_mlip_competing_phase_hull": "使用同一机器学习势补齐竞争相凸包",
+    "complete_consistent_defect_screening": "使用一致设置完成缺陷筛查",
+    "recompute_stability_evidence_with_one_mlp_model": "使用同一模型重新计算稳定性证据",
+    "verify_imaginary_modes_with_larger_supercells_or_dft": "使用更大超胞或 DFT 复核虚频",
+    "verify_high_mixing_penalty_before_further_investment": "进一步研究前先复核较高混合焓",
+    "test_additional_sqs_compositions_and_energy_convergence": "比较更多合金组分并检查能量收敛",
+    "verify_competing_phases_and_hull_with_consistent_dft": "使用一致的 DFT 设置复核竞争相和凸包",
+    "verify_borderline_hull_distance_with_consistent_dft": "使用一致的 DFT 设置复核边界凸包距离",
+    "perform_consistent_high_fidelity_dft_validation": "使用一致设置开展高精度 DFT 验证",
+    "test_multiple_sqs_compositions_and_supercell_convergence": "比较多个 SQS 组分并检查超胞收敛",
+    "consider_defect_screening_for_priority_candidates": "对优先候选开展缺陷筛查",
+    "deprioritize_unless_the_negative_signal_is_resolved": "负面信号解决前降低研究优先级",
+    "resolve_missing_or_conflicting_evidence_before_ranking": "排序前补齐缺失证据并解决证据冲突",
+}
+
+
+def _recommendation_label_zh(value: object) -> str:
+    """Translate display labels while retaining unrecognized source values."""
+    text = "" if value is None else str(value)
+    return _RECOMMENDATION_LABELS_ZH.get(
+        text, "：".join(_RECOMMENDATION_LABELS_ZH.get(part, part) for part in text.split(":"))
+    )
+
+
+def _recommendation_list_zh(value: object) -> str:
+    """Render the recommendation CSV's JSON code lists as Chinese text."""
+    if value is None or value == "":
+        return "—"
+    try:
+        entries = json.loads(str(value))
+    except (TypeError, ValueError):
+        return _recommendation_label_zh(value)
+    if not isinstance(entries, list):
+        return _recommendation_label_zh(value)
+    return "；".join(_recommendation_label_zh(entry) for entry in entries) or "—"
+
+
 class RecommendationReportPage(QWidget):
     """Readable Stage 12 report and evidence view for presentation/use."""
 
@@ -3839,7 +4121,7 @@ class RecommendationReportPage(QWidget):
         title.setObjectName("pageTitle")
         header.addWidget(title)
         header.addStretch(1)
-        self.badge = QLabel("Stage 12")
+        self.badge = QLabel("阶段 12")
         self.badge.setObjectName("stateBadge")
         header.addWidget(self.badge)
         root.addLayout(header)
@@ -3852,7 +4134,7 @@ class RecommendationReportPage(QWidget):
         subtitle.setObjectName("pageDescription")
         root.addWidget(subtitle)
 
-        summary_box = QGroupBox("Summary / 汇总")
+        summary_box = QGroupBox("汇总")
         summary_form = QFormLayout(summary_box)
         summary_form.setContentsMargins(8, 10, 8, 8)
         self.generated_label = QLabel("-")
@@ -3882,23 +4164,23 @@ class RecommendationReportPage(QWidget):
         self.recommendation_table = QTableWidget(0, 17)
         self.recommendation_table.setHorizontalHeaderLabels(
             [
-                "Rank",
-                "Class",
-                "Evidence",
-                "Pair",
-                "x(B)",
-                "Gap A/B (eV)",
-                "Mixing meV/atom",
-                "Phonon",
-                "Min freq THz",
-                "Hull eV/atom",
-                "Hull signal",
-                "MP backend",
-                "Structure ID",
-                "SQS file",
-                "Endmembers",
-                "Risks",
-                "Next steps",
+                "排名",
+                "推荐分类",
+                "证据等级",
+                "端元配对",
+                "B 组分比例",
+                "端元 A/B 带隙 (eV)",
+                "混合焓 (meV/原子)",
+                "声子稳定性",
+                "最低频率 (THz)",
+                "凸包距离 (eV/原子)",
+                "相稳定性判定",
+                "MP 数据来源",
+                "结构编号",
+                "合金结构文件",
+                "端元结构文件",
+                "风险提示",
+                "下一步建议",
             ]
         )
         self.recommendation_table.verticalHeader().setVisible(False)
@@ -3908,11 +4190,11 @@ class RecommendationReportPage(QWidget):
         self.recommendation_table.setMinimumHeight(260)
         self.recommendation_table.horizontalHeader().setStretchLastSection(True)
         for column, width in enumerate(
-            [46, 92, 70, 120, 58, 110, 118, 88, 92, 98, 82, 80, 210, 230, 230, 220, 240]
+            [56, 100, 90, 120, 100, 170, 165, 110, 150, 170, 130, 130, 210, 230, 230, 260, 280]
         ):
             self.recommendation_table.setColumnWidth(column, width)
         table_layout.addWidget(self.recommendation_table)
-        self.tabs.addTab(table_page, "推荐候选 / Candidates")
+        self.tabs.addTab(table_page, "推荐候选")
 
         report_page = QWidget()
         report_layout = QVBoxLayout(report_page)
@@ -3945,7 +4227,7 @@ class RecommendationReportPage(QWidget):
         return Path(self.project_provider()).expanduser().resolve()
 
     def _path(self, relative: str) -> Path:
-        return self._project_root() / relative
+        return imported_artifact(self._project_root(), relative)
 
     def _summary(self) -> dict[str, Any]:
         path = self._path("12_recommend/recommendation_summary.json")
@@ -3961,10 +4243,18 @@ class RecommendationReportPage(QWidget):
         self.generated_label.setText(str(summary.get("generated_at") or "-"))
         self.count_label.setText(str(summary.get("recommendation_count") or "0"))
         self.class_label.setText(
-            json.dumps(summary.get("classification_counts") or {}, ensure_ascii=False)
+            "；".join(
+                f"{_recommendation_label_zh(label)}：{count}"
+                for label, count in (summary.get("classification_counts") or {}).items()
+            )
+            or "—"
         )
         self.evidence_label.setText(
-            json.dumps(summary.get("evidence_level_counts") or {}, ensure_ascii=False)
+            "；".join(
+                f"{label}：{count}"
+                for label, count in (summary.get("evidence_level_counts") or {}).items()
+            )
+            or "—"
         )
 
         recommendations = _read_csv_dicts(self._path("12_recommend/recommendations.csv"))
@@ -4019,8 +4309,14 @@ class RecommendationReportPage(QWidget):
             row_index = self.recommendation_table.rowCount()
             self.recommendation_table.insertRow(row_index)
             for column, value in enumerate(values):
-                item = QTableWidgetItem(_compact_value(value))
-                item.setToolTip("" if value is None else str(value))
+                display = value
+                if column in (1, 7, 10, 11):
+                    display = _recommendation_label_zh(value)
+                elif column in (15, 16):
+                    display = _recommendation_list_zh(value)
+                item = QTableWidgetItem(_compact_value(display))
+                item.setToolTip("" if display is None else str(display))
+                item.setData(Qt.UserRole, value)
                 self.recommendation_table.setItem(row_index, column, item)
 
         report_path = self._path("12_recommend/recommendation_report.md")
@@ -4314,6 +4610,20 @@ class InspectorPanel(QWidget):
         self.status_value.setText(status or "-")
 
 
+class DocumentStack(QStackedWidget):
+    """Let the image page fit the viewport without hidden forms' height hints."""
+
+    def hasHeightForWidth(self) -> bool:  # noqa: N802
+        if isinstance(self.currentWidget(), PhaseResultsPage):
+            return False
+        return super().hasHeightForWidth()
+
+    def heightForWidth(self, width: int) -> int:  # noqa: N802
+        if isinstance(self.currentWidget(), PhaseResultsPage):
+            return self.currentWidget().minimumSizeHint().height()
+        return super().heightForWidth(width)
+
+
 class MainWindow(QMainWindow):
     """SS-Screen desktop engineering workbench with multi-project roots."""
 
@@ -4335,9 +4645,17 @@ class MainWindow(QMainWindow):
             min(1000, available.height()) if available else 1000,
         )
 
-        self._pages: dict[tuple[str, ...], CommandPage] = {}
+        self._pages: dict[
+            tuple[str, ...],
+            CommandPage | GapBundlePage | GapCollectPage | WavelengthPairPage | SqsPage | RelaxPage | StabilityPage,
+        ] = {}
         self._command_lookup = self._collect_commands()
         self._current_run: RunRecord | None = None
+        self._gap_collection_run: tuple[Path, tuple[str, ...]] | None = None
+        self._condense_stop_file: Path | None = None
+        self._stop_requested = False
+        self._handoff_after_stop = False
+        self._close_after_stop = False
 
         self._projects: list[ProjectRecord] = []
         self._active_project: ProjectRecord | None = None
@@ -4350,11 +4668,18 @@ class MainWindow(QMainWindow):
         self.process.errorOccurred.connect(self._process_error)
 
         self._build_ui()
+        self._default_forms = capture_forms(self)
+        self.workflow = WorkflowController(self)
 
         initial = Path(project_dir).expanduser() if project_dir else Path.cwd()
         initial = _find_project_root(initial)
         self._add_project(initial.resolve(), initialize=False, activate=True)
         self._apply_style()
+        if self.workflow.settings.get("ten_micron_profile"):
+            from ssscreen.gui.ten_micron_page import open_stage
+            open_stage(self, 1)
+        elif self.workflow.settings.get("workflow_stages"):
+            self.workflow.show_parameters()
 
     def _collect_commands(self) -> dict[tuple[str, ...], click.Command]:
         lookup: dict[tuple[str, ...], click.Command] = {}
@@ -4444,6 +4769,9 @@ class MainWindow(QMainWindow):
             self.new_project,
             icon_name="new_project",
         )
+        from ssscreen.gui.ten_micron_page import new_workspace
+
+        add_tool("新建 / 打开 10 µm 工作区", lambda: new_workspace(self))
 
         add_tool(
             "打开工程文件.ssproject",
@@ -4546,7 +4874,7 @@ class MainWindow(QMainWindow):
         doc_head_layout.addStretch(1)
         document_layout.addWidget(document_header)
 
-        self.stack = QStackedWidget()
+        self.stack = DocumentStack()
         self.stack.currentChanged.connect(self._refresh_font_layout)
         self.dashboard = Dashboard(self.project_root)
         self.stack.addWidget(self.dashboard)
@@ -4561,11 +4889,22 @@ class MainWindow(QMainWindow):
 
         self.structure_archive_page = StructureArchivePage(self.project_root)
         self.structure_archive_page.run_requested.connect(self.run_command)
+        self.structure_archive_page.stop_requested.connect(self.stop_process)
+        self.structure_archive_page.use_completed_requested.connect(self._use_completed_condense)
         self.stack.addWidget(self.structure_archive_page)
+        self.composition_screen_page.structures_output.textChanged.connect(
+            self._sync_composition_archive_input
+        )
+        self.structure_archive_page.df_follow_composition.toggled.connect(
+            self._sync_composition_archive_input
+        )
 
         self.structure_match_page = StructureMatchPage(self.project_root)
         self.structure_match_page.run_requested.connect(self.run_command)
         self.stack.addWidget(self.structure_match_page)
+        self.structure_match_page.follow_stage03.toggled.connect(self._sync_structure_match_inputs)
+        self.structure_archive_page.df_output_dir.textChanged.connect(self._sync_structure_match_inputs)
+        self.composition_screen_page.candidates_output.textChanged.connect(self._sync_structure_match_inputs)
 
         self.structure_results_page = StructureResultsPage(self.project_root)
         self.stack.addWidget(self.structure_results_page)
@@ -4573,7 +4912,7 @@ class MainWindow(QMainWindow):
         self.phonon_results_page = PhononResultsPage(self.project_root)
         self.stack.addWidget(self.phonon_results_page)
 
-        self.phase_results_page = PhaseResultsPage(self.project_root)
+        self.phase_results_page = PhaseResultsPage(self.project_root, settings=self._display_settings)
         self.stack.addWidget(self.phase_results_page)
 
         self.recommendation_report_page = RecommendationReportPage(self.project_root)
@@ -4582,6 +4921,7 @@ class MainWindow(QMainWindow):
 
         # Stage 13 is a local GUI assessment, not a Click/DFT computation.
         self.detector_assessment_page = DetectorAssessmentPage(self.project_root)
+        self.detector_assessment_page.run_requested.connect(self.run_command)
         self.stack.addWidget(self.detector_assessment_page)
 
         self.document_scroll = QScrollArea()
@@ -4695,6 +5035,18 @@ class MainWindow(QMainWindow):
         if initialize:
             self._initialize_project_path(path)
 
+        metadata = read_project(path)
+        if settings is None:
+            settings = metadata.get("gui_settings", {})
+        from ssscreen.ten_micron import PROFILE
+        from ssscreen.gui.ten_micron_page import native_settings
+        if not settings.get("ten_micron_profile") and (path / PROFILE).is_file():
+            settings = {**native_settings(json.loads((path / PROFILE).read_text(encoding="utf-8"))), **settings}
+        if settings.get("ten_micron_profile"):
+            settings.setdefault("wsl_project_path","")
+        if name is None:
+            name = metadata.get("name")
+
         project = ProjectRecord(
             name=name or path.name or "工程",
             path=path,
@@ -4709,10 +5061,12 @@ class MainWindow(QMainWindow):
         if self._active_project is None:
             self._active_project = project
 
-        self._rebuild_project_tree()
-
         if activate:
             self._activate_project(project)
+
+        # Stage status uses the active form paths; restore them before reading
+        # artifacts in custom directories when opening a saved project.
+        self._rebuild_project_tree()
 
         return project
 
@@ -4736,8 +5090,149 @@ class MainWindow(QMainWindow):
             except OSError:
                 pass
 
+    def _mp_project_paths(self, project: ProjectRecord) -> tuple[Path, Path]:
+        if project is self._active_project:
+            output = self.dataset_source_page.mp_output.text()
+            provenance = self.dataset_source_page.mp_provenance.text()
+        else:
+            form = (project.settings or {}).get("forms", {}).get("dataset_source_page", {})
+            output = form.get("mp_output", "01_dataset/mp.df")
+            provenance = form.get("mp_provenance", "01_dataset/mp.df.provenance.json")
+        return (
+            _resolve_project_path(project.path, output),
+            _resolve_project_path(project.path, provenance),
+        )
+
+    def _composition_project_paths(self, project: ProjectRecord) -> tuple[Path, ...]:
+        defaults = {
+            "candidates_output": "02_composition/composition_candidates.csv",
+            "summary_output": "02_composition/composition_summary.json",
+            "structures_output": "02_composition/candidates.df",
+        }
+        form = (project.settings or {}).get("forms", {}).get("composition_screen_page", {})
+        return tuple(
+            _resolve_project_path(
+                project.path,
+                (
+                    getattr(self.composition_screen_page, key).text()
+                    if project is self._active_project
+                    else form.get(key, default)
+                ),
+            )
+            for key, default in defaults.items()
+        )
+
+    def _configured_project_path(
+        self, project: ProjectRecord, page_name: str, key: str, default: str
+    ) -> Path:
+        if project is self._active_project:
+            value = getattr(getattr(self, page_name), key).text()
+        else:
+            value = (project.settings or {}).get("forms", {}).get(page_name, {}).get(key, default)
+        return _resolve_project_path(project.path, value)
+
     def _stage_status(self, root: Path, directory: str) -> tuple[str, int]:
+        project = self._project_by_path(root)
+        if project and project.settings and project.settings.get("ten_micron_profile"):
+            from ssscreen.ten_micron import CACHED
+            from ssscreen.gui.ten_micron_page import marker
+            sid = directory[:2]
+            if sid == "13" and (root / directory / "candidate_evaluation.csv").is_file():
+                return "几何数据已预置", 0
+            if sid.isdigit() and int(sid) in CACHED:
+                return ("已使用预计算结果" if marker(root, int(sid)).is_file() else "预计算结果已预置"), 0
+        if directory == "08_relax" and project is self._active_project:
+            page = self._pages.get(("stability", "relax"))
+            status = page.result_status() if page else {}
+            if status.get("ready"):
+                return "可进入09", status["success"]
+        if directory == "07_sqs" and project is self._active_project:
+            page = self._pages.get(("stability", "sqs-generate"))
+            status = page.result_status() if page else {}
+            if status.get("ready"):
+                return f"已生成，跳过 {status['skipped']}", status["written"]
+        if directory == "05_gap" and project is self._active_project:
+            page = self._pages.get(("gap-collect-vasp",))
+            report = page._collection_report() if page else {}
+            if page and page._validated(report):
+                return (
+                    f"已校验，成功 {report['status_counts'].get('success', 0)}",
+                    report["collected_result_count"],
+                )
+        if project and project.settings and not project.settings.get("ten_micron_profile"):
+            stage = project.settings.get("workflow_stages", {}).get(directory[:2])
+            if stage:
+                return stage["status"], stage["count"]
         path = root / directory
+        if directory == "06_pair" and project:
+            page = self._pages.get(("pair-wavelength",)) if project is self._active_project else None
+            argv = (
+                page.argv() if page is not None
+                else (project.settings or {}).get("commands", {}).get("pair-wavelength", [])
+            )
+            if "--output" in argv and "--summary" in argv:
+                output = _resolve_project_path(root, argv[argv.index("--output") + 1])
+                summary = _resolve_project_path(root, argv[argv.index("--summary") + 1])
+                try:
+                    report = json.loads(summary.read_text(encoding="utf-8"))
+                    with output.open(encoding="utf-8-sig", newline="") as stream:
+                        reader = csv.DictReader(stream)
+                        if {"mp_id_a", "mp_id_b"} <= set(reader.fieldnames or []):
+                            count = sum(1 for _ in reader)
+                            if count == int(report["pair_count"]):
+                                return "已筛选", count
+                except (OSError, ValueError, KeyError, csv.Error):
+                    pass
+        if directory == "05_gap" and project:
+            page = self._pages.get(("gap-export",)) if project is self._active_project else None
+            if page is not None:
+                output = page.output_edit.text()
+            else:
+                argv = (project.settings or {}).get("commands", {}).get("gap-export", [])
+                output = argv[argv.index("--output") + 1] if "--output" in argv else ""
+            if output:
+                archive = _resolve_project_path(root, output)
+                if archive.suffix.lower() != ".zip":
+                    archive = archive.with_name("带隙计算输入.zip")
+                try:
+                    with zipfile.ZipFile(archive) as handle:
+                        report = json.loads(handle.read("bundle_manifest.json"))
+                    return "已打包", int(report["task_count"])
+                except (OSError, ValueError, KeyError, zipfile.BadZipFile):
+                    pass
+        if directory == "03_condensed" and project:
+            archive = self._configured_project_path(
+                project, "structure_archive_page", "df_output_dir", "03_condensed/local"
+            )
+            count = sum(1 for _ in archive.glob("*.json")) if archive.is_dir() else 0
+            if count:
+                return "已有描述", count
+        if directory == "04_groups" and project:
+            summary_path = self._configured_project_path(
+                project,
+                "structure_match_page",
+                "summary_output",
+                "04_groups/structure_match_summary.json",
+            )
+            try:
+                report = json.loads(summary_path.read_text(encoding="utf-8"))
+                return ("部分结果" if report.get("partial_run") else "有结果"), int(
+                    report["group_count"]
+                )
+            except (OSError, ValueError, KeyError):
+                pass
+        if directory == "02_composition" and project:
+            files = [p for p in self._composition_project_paths(project) if p.is_file()]
+            if files:
+                return "有产物", len(files)
+        if directory == "01_dataset" and project:
+            try:
+                files = set(path.iterdir()) if path.is_dir() else set()
+            except OSError:
+                files = set()
+            files.update(p for p in self._mp_project_paths(project) if p.is_file())
+            if files:
+                return "有产物", len(files)
         if not path.exists():
             return "未开始", 0
         try:
@@ -4788,8 +5283,7 @@ class MainWindow(QMainWindow):
 
                     if sid == "01":
                         dataset_root = project.path / "01_dataset"
-                        mp_df = dataset_root / "mp.df"
-                        mp_provenance = dataset_root / "mp.df.provenance.json"
+                        mp_df, mp_provenance = self._mp_project_paths(project)
                         wbm_df = dataset_root / "wbm.df"
 
                         mp_parent = QTreeWidgetItem(
@@ -4888,8 +5382,9 @@ class MainWindow(QMainWindow):
                     elif sid == "02":
                         composition_root = project.path / "02_composition"
                         valid_ids = composition_root / "valid_ids.json"
-                        candidate_file = composition_root / "composition_candidates.csv"
-                        composition_summary = composition_root / "composition_summary.json"
+                        candidate_file, composition_summary, structures_file = (
+                            self._composition_project_paths(project)
+                        )
 
                         candidate_count = 0
                         template_count = None
@@ -4950,9 +5445,8 @@ class MainWindow(QMainWindow):
                         object_status = {
                             "input": "MP / WBM / 自定义",
                             "rules": "Template screening",
-                            "candidates": (
-                                f"{candidate_count} 条" if candidate_count else "未生成"
-                            ),
+                            "structures": "已生成" if structures_file.is_file() else "未生成",
+                            "candidates": (f"{candidate_count} 条" if candidate_count else "未生成"),
                             "summary": (
                                 (
                                     f"{template_count} templates"
@@ -4979,28 +5473,23 @@ class MainWindow(QMainWindow):
                             stage_item.addChild(object_item)
 
                     elif sid == "03":
-                        archive_root = project.path / "03_condensed"
-                        description_count = 0
-                        for folder_name in ("local", "mp", "user"):
-                            folder = archive_root / folder_name
-                            if folder.exists():
-                                description_count += len(list(folder.glob("*.json")))
-
-                        manifest_ready = (
-                            any(archive_root.glob("*manifest*.jsonl"))
-                            if archive_root.exists()
-                            else False
+                        configured_archive = self._configured_project_path(
+                            project, "structure_archive_page", "df_output_dir", "03_condensed/local"
                         )
-                        index_ready = (
-                            any(archive_root.glob("*index*.csv"))
-                            if archive_root.exists()
-                            else False
-                        )
-                        validation_ready = (
-                            any(archive_root.glob("*validation*.csv"))
-                            if archive_root.exists()
-                            else False
-                        )
+                        description_count = sum(1 for _ in configured_archive.glob("*.json"))
+                        manifest_ready = self._configured_project_path(
+                            project,
+                            "structure_archive_page",
+                            "df_manifest",
+                            "03_condensed/local_manifest.jsonl",
+                        ).is_file()
+                        index_ready = self._configured_project_path(
+                            project,
+                            "structure_archive_page",
+                            "df_index",
+                            "03_condensed/local_index.csv",
+                        ).is_file()
+                        validation_ready = (configured_archive.parent / "validation.csv").is_file()
 
                         object_status = {
                             "input": "DataFrame / Files",
@@ -5024,18 +5513,33 @@ class MainWindow(QMainWindow):
                             stage_item.addChild(object_item)
 
                     elif sid == "04":
-                        candidate_file = (
-                            project.path / "02_composition" / "composition_candidates.csv"
+                        candidate_file = self._configured_project_path(
+                            project,
+                            "structure_match_page",
+                            "candidates_edit",
+                            "02_composition/composition_candidates.csv",
                         )
-                        archive_root = project.path / "03_condensed"
-                        archive_count = 0
-                        for folder_name in ("local", "mp", "user", "structures"):
-                            folder = archive_root / folder_name
-                            if folder.exists() and any(folder.glob("*.json")):
-                                archive_count += 1
-
-                        groups_file = project.path / "04_groups" / "groups.json"
-                        summary_file = project.path / "04_groups" / "structure_match_summary.json"
+                        archives = (
+                            self.structure_match_page._archive_paths()
+                            if project is self._active_project
+                            else (project.settings or {})
+                            .get("forms", {})
+                            .get("structure_match_page", {})
+                            .get("archives", ["03_condensed/local"])
+                        )
+                        archive_count = sum(
+                            any(_resolve_project_path(project.path, raw).glob("*.json"))
+                            for raw in archives
+                        )
+                        groups_file = self._configured_project_path(
+                            project, "structure_match_page", "groups_output", "04_groups/groups.json"
+                        )
+                        summary_file = self._configured_project_path(
+                            project,
+                            "structure_match_page",
+                            "summary_output",
+                            "04_groups/structure_match_summary.json",
+                        )
 
                         group_count = 0
                         if groups_file.exists():
@@ -5118,7 +5622,62 @@ class MainWindow(QMainWindow):
         if project is None:
             return
 
-        self._activate_project(project)
+        if self._active_project is not project:
+            self._activate_project(project)
+
+        if self.workflow.settings.get("ten_micron_profile"):
+            ancestor = item
+            while ancestor is not None:
+                payload = ancestor.data(0, Qt.UserRole)
+                if payload and payload[0] == "stage":
+                    self.workflow.select_stage(payload[2])
+                    break
+                ancestor = ancestor.parent()
+
+        if kind == "stage" and data[2] in {"05", "06", "07", "08", *STABILITY_PATHS}:
+            item.setExpanded(True)
+            if not self.workflow.settings.get("workflow_stages"):
+                default_command = {
+                    "05": ("gap-export",),
+                    "06": ("pair-wavelength",),
+                    "07": ("stability", "sqs-generate"),
+                    "08": ("stability", "relax"),
+                    **STABILITY_PATHS,
+                }[data[2]]
+                command_path = tuple(
+                    self.workflow.settings.get("stage_commands", {}).get(
+                        data[2], default_command
+                    )
+                )
+                if data[2] in {"06", "07", "08", *STABILITY_PATHS}:
+                    command_path = default_command
+                for index in range(item.childCount()):
+                    child = item.child(index)
+                    child_data = child.data(0, Qt.UserRole)
+                    if (
+                        child_data
+                        and child_data[0] == "command"
+                        and tuple(child_data[2]) == command_path
+                    ):
+                        self.nav.setCurrentItem(child)
+                        self._navigation_clicked(child, 0)
+                        return
+
+        if kind == "stage" and self.workflow.settings.get("workflow_stages"):
+            self.workflow.select_stage(data[2])
+            self.workflow.show_parameters()
+            self.inspector.set_selection(
+                item_type="工程阶段",
+                name=item.text(0),
+                path=str(project.path / data[3]),
+                status=item.text(1),
+            )
+            return
+        if kind == "command":
+            command_path = tuple(data[2])
+            presentation = next((p for p in COMMANDS if p.command_path == command_path), None)
+            if presentation:
+                self.workflow.select_stage(presentation.stage)
 
         if kind in {"project", "dashboard"}:
             self.stack.setCurrentWidget(self.dashboard)
@@ -5154,7 +5713,7 @@ class MainWindow(QMainWindow):
                 self.inspector.set_selection(
                     item_type="工程阶段",
                     name="Stage 01：外部材料数据源",
-                    path=str(project.path / directory),
+                    path=str(self._mp_project_paths(project)[0].parent),
                     status=status if count == 0 else f"{status} · {count} 项",
                 )
             elif sid == "02":
@@ -5163,8 +5722,8 @@ class MainWindow(QMainWindow):
                 self.document_label.setText(f"{project.name} / 组成模板筛选")
                 self.inspector.set_selection(
                     item_type="工程阶段",
-                    name="流程第 1 步：组成模板筛选",
-                    path=str(project.path / directory),
+                    name="Stage 02：组成模板筛选",
+                    path=str(self._composition_project_paths(project)[0].parent),
                     status=status if count == 0 else f"{status} · {count} 项",
                 )
             elif sid == "03":
@@ -5173,8 +5732,12 @@ class MainWindow(QMainWindow):
                 self.document_label.setText(f"{project.name} / 结构描述归档")
                 self.inspector.set_selection(
                     item_type="工程阶段",
-                    name="流程第 2 步：结构描述归档",
-                    path=str(project.path / directory),
+                    name="Stage 03：结构描述归档",
+                    path=str(
+                        self.structure_archive_page._resolve(
+                            self.structure_archive_page.df_output_dir.text()
+                        )
+                    ),
                     status=status if count == 0 else f"{status} · {count} 项",
                 )
             elif sid == "04":
@@ -5183,8 +5746,12 @@ class MainWindow(QMainWindow):
                 self.document_label.setText(f"{project.name} / 结构匹配与材料分组")
                 self.inspector.set_selection(
                     item_type="工程阶段",
-                    name="流程第 3 步：结构匹配与材料分组",
-                    path=str(project.path / directory),
+                    name="Stage 04：结构匹配与材料分组",
+                    path=str(
+                        self.structure_match_page._resolve(
+                            self.structure_match_page.groups_output.text()
+                        ).parent
+                    ),
                     status=status if count == 0 else f"{status} · {count} 项",
                 )
             elif sid == "08":
@@ -5230,10 +5797,10 @@ class MainWindow(QMainWindow):
             elif sid == "13":
                 self.detector_assessment_page.refresh()
                 self.stack.setCurrentWidget(self.detector_assessment_page)
-                self.document_label.setText(f"{project.name} / 探测器性能评估")
+                self.document_label.setText(f"{project.name} / 固溶体候选评价")
                 self.inspector.set_selection(
-                    item_type="应用适配性评估",
-                    name="Stage 13：探测器性能评估（展示/预筛）",
+                    item_type="候选评价",
+                    name="Stage 13：固溶体候选几何评价与材料级预筛",
                     path=str(project.path / directory),
                     status=status if count == 0 else f"{status} · {count} 项",
                 )
@@ -5281,9 +5848,11 @@ class MainWindow(QMainWindow):
             self.stack.setCurrentWidget(self.composition_screen_page)
             self.document_label.setText(f"{project.name} / 组成模板筛选 / {object_name}")
 
-            if object_key in {"candidates", "summary"}:
+            if object_key in {"candidates", "summary", "structures"}:
                 object_type = "组成筛选结果"
-                object_path = project.path / "02_composition"
+                object_path = self._composition_project_paths(project)[
+                    {"candidates": 0, "summary": 1, "structures": 2}[object_key]
+                ]
             else:
                 object_type = "组成筛选设置"
                 object_path = project.path
@@ -5395,14 +5964,13 @@ class MainWindow(QMainWindow):
         self.active_project_label.setToolTip(
             str(project.path)
         )
+        self.setWindowTitle("SS-Screen V1.0 · Materials Engineering Workbench" +
+                            (f" · {project.name}" if project.settings.get("ten_micron_profile") else ""))
 
         self._refresh_file_tree()
 
         self.dashboard.refresh()
-        self.structure_results_page.refresh()
-        self.phonon_results_page.refresh()
-        self.phase_results_page.refresh()
-        self.detector_assessment_page.refresh()
+        self.workflow.refresh()
 
     def new_project(self) -> None:
         parent = QFileDialog.getExistingDirectory(
@@ -5445,7 +6013,11 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "创建工程失败", str(exc))
             return
 
-        self.document_label.setText(f"{project.name} / 工程概览")
+        if project.settings.get("ten_micron_profile"):
+            from ssscreen.gui.ten_micron_page import open_stage
+            open_stage(self, 1)
+        else:
+            self.document_label.setText(f"{project.name} / 工程概览")
         self.statusBar().showMessage(f"已创建工程：{project.name}")
 
     def _project_settings_snapshot(self) -> dict[str, Any]:
@@ -5476,7 +6048,19 @@ class MainWindow(QMainWindow):
         for path, page in self._pages.items():
             commands[" ".join(path)] = page.argv()
 
+        values = dict((project.settings or {}).get("command_values", {})) if project else {}
+        command_forms = dict((project.settings or {}).get("command_forms", {})) if project else {}
+        for path in self._pages:
+            values.pop(" ".join(path), None)
+            if hasattr(self._pages[path], "form_state"):
+                command_forms[" ".join(path)] = self._pages[path].form_state()
+
         return {
+            **(project.settings or {} if project else {}),
+            "artifact_aliases": read_project(project.path).get("artifacts", {}) if project else {},
+            "forms": capture_forms(self),
+            "command_values": values,
+            "command_forms": command_forms,
             "runtime_backend":
                 self.runtime_backend.currentText(),
 
@@ -5486,6 +6070,42 @@ class MainWindow(QMainWindow):
             "commands": commands,
         }
 
+    def _sync_composition_archive_input(self) -> None:
+        if self.structure_archive_page.df_follow_composition.isChecked():
+            self.structure_archive_page.df_path.setText(
+                self.composition_screen_page.structures_output.text()
+            )
+
+    def _sync_structure_match_inputs(self) -> None:
+        page = self.structure_match_page
+        if not page.follow_stage03.isChecked():
+            return
+        page.candidates_edit.setText(self.composition_screen_page.candidates_output.text())
+        page.archive_table.setRowCount(0)
+        value = self.structure_archive_page.df_output_dir.text().strip()
+        if value:
+            page._append_archive(self.structure_archive_page._resolve(value))
+        page.refresh_inputs()
+
+    def _use_completed_condense(self) -> None:
+        if self.process.state() != QProcess.NotRunning:
+            if self._condense_stop_file is None:
+                QMessageBox.warning(self, "其他任务运行中", "请先等待当前任务结束。")
+                return
+            self._handoff_after_stop = True
+            self.stop_process()
+            return
+        archive = self.structure_archive_page._resolve(self.structure_archive_page.df_output_dir.text())
+        if not archive.is_dir() or not any(archive.glob("*.json")):
+            QMessageBox.warning(self, "暂无已完成描述", "请先生成至少一个结构描述。")
+            return
+        self.structure_match_page.follow_stage03.setChecked(True)
+        self._sync_structure_match_inputs()
+        self.structure_match_page.select_section("input")
+        self.stack.setCurrentWidget(self.structure_match_page)
+        self.document_label.setText("04 结构匹配 · 使用 03 已完成描述")
+        self.statusBar().showMessage("已接入 03 当前结果；点击“开始结构匹配”运行 04。")
+
     def _apply_project_settings(
         self,
         settings: dict[str, Any] | None,
@@ -5494,6 +6114,9 @@ class MainWindow(QMainWindow):
 
         if not isinstance(settings, dict):
             settings = {}
+
+        restore_forms(self, self._default_forms)
+        restore_forms(self, settings.get("forms", {}))
 
         # --------------------------------------------------
         # Runtime backend
@@ -5541,6 +6164,18 @@ class MainWindow(QMainWindow):
                 # 这个工程没有保存该页面参数，
                 # 防止前一个工程的参数残留过来。
                 page.reset()
+
+            self.workflow.configure_command(page)
+            if hasattr(page, "restore_form_state"):
+                page.restore_form_state(settings.get("command_forms", {}).get(key, {}))
+
+        if ("pair-wavelength",) in self._pages:
+            self._pages[("pair-wavelength",)].refresh_preview()
+        if ("stability", "sqs-generate") in self._pages:
+            self._pages[("stability", "sqs-generate")].refresh_preview()
+        if ("stability", "relax") in self._pages:
+            self._pages[("stability", "relax")].refresh_preview()
+        self._refresh_stability_inputs()
 
     def save_project_file(self) -> None:
         project = self._active_project
@@ -5593,16 +6228,25 @@ class MainWindow(QMainWindow):
         source = Path(value).resolve()
         try:
             project_metadata, _manifest = inspect_project_file(source)
-            source_digest = hashlib.sha256()
-            with source.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    source_digest.update(chunk)
-            digest = source_digest.hexdigest()[:12]
-            cache_base = (
-                Path(os.environ.get("LOCALAPPDATA", Path.home())) / "SS-Screen" / "projects"
-            )
-            cache_root = cache_base / f"{source.stem}-{digest}"
-            extract_project_file(source, cache_root)
+            profile = project_metadata.get("settings", {}).get("ten_micron_profile")
+            if profile:
+                from ssscreen.gui.ten_micron_page import unpack_example
+                selected = QFileDialog.getExistingDirectory(self, "选择空目录作为算例工程根目录", str(source.parent))
+                if not selected:
+                    return
+                cache_root = Path(selected).resolve()
+                unpack_example(source, cache_root, profile)
+            else:
+                source_digest = hashlib.sha256()
+                with source.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        source_digest.update(chunk)
+                digest = source_digest.hexdigest()[:12]
+                cache_base = (
+                    Path(os.environ.get("LOCALAPPDATA", Path.home())) / "SS-Screen" / "projects"
+                )
+                cache_root = cache_base / f"{source.stem}-{digest}"
+                extract_project_file(source, cache_root)
             saved_settings = project_metadata.get(
                 "settings",
                 {},
@@ -5622,7 +6266,11 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "打开项目失败", str(exc))
             return
-        self.document_label.setText(f"{project.name} / 工程概览")
+        if self.workflow.settings.get("ten_micron_profile"):
+            from ssscreen.gui.ten_micron_page import open_stage
+            open_stage(self, 1)
+        else:
+            self.document_label.setText(f"{project.name} / 工程概览")
         self.statusBar().showMessage(f"已校验并打开：{source.name}")
 
     def remove_active_project(self) -> None:
@@ -5679,6 +6327,11 @@ class MainWindow(QMainWindow):
     # ---------------- Command pages ----------------
 
     def _show_command_page(self, path: tuple[str, ...]) -> None:
+        # Saved workspaces may still point at the former separate validation page.
+        if path == ("gap-validate",):
+            path = ("gap-collect-vasp",)
+        elif path in {("pair",), ("gap-compare",)}:
+            path = ("pair-wavelength",)
         if path == ("dataset", "mp"):
             self.dataset_source_page.select_section("mp")
             self.stack.setCurrentWidget(self.dataset_source_page)
@@ -5711,18 +6364,63 @@ class MainWindow(QMainWindow):
             self.stack.setCurrentWidget(self.structure_match_page)
             return
 
-        if path == ("recommend",):
-            self.recommendation_report_page.refresh()
-            self.stack.setCurrentWidget(self.recommendation_report_page)
-            return
-
+        if path in STABILITY_PATHS.values() and ("stability", "relax") not in self._pages:
+            self._show_command_page(("stability", "relax"))
+        if path == ("stability", "relax") and ("stability", "sqs-generate") not in self._pages:
+            self._show_command_page(("stability", "sqs-generate"))
+        if path == ("stability", "sqs-generate") and ("pair-wavelength",) not in self._pages:
+            self._show_command_page(("pair-wavelength",))
+        if path == ("pair-wavelength",) and ("gap-collect-vasp",) not in self._pages:
+            # Restore the upstream form even when opening 06 directly after restart.
+            self._show_command_page(("gap-collect-vasp",))
         if path in self._pages:
+            if isinstance(self._pages[path], (GapCollectPage, WavelengthPairPage, SqsPage, RelaxPage, StabilityPage)):
+                self._pages[path].refresh_preview()
             self.stack.setCurrentWidget(self._pages[path])
             return
 
         command = self._command_lookup[path]
         presentation = next(item for item in COMMANDS if item.command_path == path)
-        page = CommandPage(presentation, command)
+        if path == ("gap-export",):
+            page = GapBundlePage(
+                presentation, command, self.project_root,
+                lambda: (
+                    self.structure_match_page.groups_output.text(),
+                    self.composition_screen_page.structures_output.text(),
+                ),
+            )
+        elif path == ("gap-collect-vasp",):
+            page = GapCollectPage(
+                presentation, command, self.project_root,
+                self._gap_export_output, self._gap_validation_tasks,
+            )
+            page.pair_requested.connect(self._open_collected_gap_pairing)
+        elif path == ("pair-wavelength",):
+            page = WavelengthPairPage(
+                presentation, command, self.project_root, self._wavelength_inputs,
+            )
+            page.sqs_requested.connect(self._open_wavelength_sqs)
+        elif path == ("stability", "sqs-generate"):
+            page = SqsPage(
+                presentation, command, self.project_root, self._sqs_inputs,
+                uses_demo_cache=lambda: bool(self.workflow.settings.get("ten_micron_profile")),
+            )
+            page.relax_requested.connect(self._open_sqs_relaxation)
+        elif path == ("stability", "relax"):
+            page = RelaxPage(
+                presentation, command, self.project_root, self._relax_inputs,
+                uses_demo_cache=lambda: bool(self.workflow.settings.get("ten_micron_profile")),
+            )
+            page.mixing_requested.connect(self._open_relaxation_mixing)
+        elif path in STABILITY_PATHS.values():
+            page = StabilityPage(
+                presentation, command, self.project_root, self._stability_inputs,
+                self._stability_input_status, ValueEditor,
+            )
+            page.next_requested.connect(self._open_stability_next)
+            self._connect_stability_inputs()
+        else:
+            page = CommandPage(presentation, command)
         page.run_requested.connect(self.run_command)
         self._pages[path] = page
         self.stack.addWidget(page)
@@ -5750,7 +6448,289 @@ class MainWindow(QMainWindow):
                 if isinstance(saved_argv, list):
                     page.restore_argv(saved_argv)
 
+        self.workflow.configure_command(page)
+        if hasattr(page, "restore_form_state") and project:
+            page.restore_form_state((project.settings or {}).get("command_forms", {}).get(" ".join(path), {}))
         self.stack.setCurrentWidget(page)
+
+    def _wavelength_inputs(self) -> tuple[str, str, bool]:
+        groups = self.structure_match_page.groups_output.text().strip()
+        profile = self.workflow.settings.get("ten_micron_profile")
+        if profile:
+            from ssscreen.gui.ten_micron_page import check_file, marker
+            from ssscreen.ten_micron import GROUPS, GAPS
+            root = self.project_root()
+            try:
+                if marker(root,5).is_file() and self.structure_match_page._resolve(groups)==root/GROUPS:
+                    check_file(root,GROUPS,profile["anchors"][GROUPS])
+                    check_file(root,GAPS,profile["files"][GAPS])
+                    return groups,GAPS,True
+            except (OSError,ValueError):
+                pass
+            return groups,GAPS,False
+        page = self._pages.get(("gap-collect-vasp",))
+        verified = page.validated_result() if page else None
+        gaps = page.output_paths()[0] if page else "05_gap/results_returned.csv"
+        ready = bool(verified and self.structure_match_page._resolve(groups).is_file())
+        return groups, verified or gaps, ready
+
+    def _sqs_inputs(self) -> tuple[str, str, bool]:
+        page = self._pages.get(("pair-wavelength",))
+        pairs = page.output_edit.text().strip() if page else "06_pair/final_pairs.csv"
+        dataset = self.composition_screen_page.structures_output.text().strip()
+        ready = bool(
+            pair_count(self.structure_match_page._resolve(pairs))
+            and self.composition_screen_page._resolve(dataset).is_file()
+        )
+        # New reports can distinguish stale files; legacy pair CSVs remain usable.
+        if ready and page:
+            try:
+                report = json.loads(page._resolve(page.summary_edit.text()).read_text(encoding="utf-8"))
+                if "input_sha256" in report:
+                    ready = bool(page.validated_result())
+            except (OSError, ValueError, TypeError):
+                pass
+        return pairs, dataset, ready
+
+    def _relax_inputs(self) -> tuple[str, str, str, bool]:
+        page = self._pages.get(("stability", "sqs-generate"))
+        manifest = page.manifest_edit.text().strip() if page else "07_sqs/sqs_manifest.jsonl"
+        pairs, dataset, _ = self._sqs_inputs()
+        ready = False
+        if page:
+            path = page._resolve(manifest)
+            try:
+                ready = bool(manifest_rows(path))
+                if ready and path.with_suffix(".provenance.json").is_file():
+                    ready = bool(page.validated_result())
+            except (OSError, ValueError, TypeError):
+                pass
+        return manifest, dataset, pairs, ready
+
+    def _stability_inputs(self, stage: str) -> dict[str, Any]:
+        relax = self._pages[("stability", "relax")]
+        results = relax.results_edit.text().strip()
+        if stage == "09":
+            return {"pairs_path": self._sqs_inputs()[0], "relax_results_path": results}
+        values = {
+            "pairs_path": self._sqs_inputs()[0],
+            "model_path": relax.model_edit.text().strip(),
+            "model_name": relax.model_name_edit.text().strip(),
+            "dtype": relax.dtype_combo.currentText(),
+        }
+        if stage == "10":
+            return {**values, "relax_results_path": results}
+        source = self.dataset_source_page
+        mode = source.mp_backend.currentData()
+        database = source.mp_offline_db.text().strip()
+        return {
+            **values, "candidate_relax_results_path": results,
+            "mp_backend": mode,
+            "offline_db": str(imported_artifact(self.project_root(), database))
+            if mode == "offline" and database else None,
+            "fmax": relax.fmax_edit.text().strip(),
+            "max_steps": relax.max_steps_edit.text().strip(),
+            "relax_cell": relax.cell_check.isChecked(),
+        }
+
+    def _stability_input_status(self, stage: str) -> dict[str, Any]:
+        if self.workflow.settings.get("ten_micron_profile"):
+            from ssscreen.gui.ten_micron_page import marker, validate_cache
+            try:
+                root = self.project_root()
+                if not marker(root,8).is_file():
+                    raise ValueError("请在 08 使用预计算结果")
+                validate_cache(root,self.workflow.settings["ten_micron_profile"],8)
+                return {"ready":True,"message":"已核验 08 弛豫记录"}
+            except (ValueError, OSError, KeyError) as exc:
+                return {"ready":False,"message":str(exc)}
+        status = self._pages[("stability", "relax")].result_status()
+        if stage == "09":
+            return status
+        if status.get("evidence_valid") and status.get("usable_sqs", 0) > 0:
+            return {"ready": True, "message": "08当前合金结果已核对。"}
+        return {"ready": False, "message": status.get("message", "等待08当前合金结果。")}
+
+    def _refresh_stability_inputs(self) -> None:
+        for page in self._pages.values():
+            if isinstance(page, StabilityPage):
+                page.refresh_preview()
+
+    def _connect_stability_inputs(self) -> None:
+        if getattr(self, "_stability_inputs_connected", False):
+            return
+        self._stability_inputs_connected = True
+        relax = self._pages[("stability", "relax")]
+        for edit in (
+            *relax._fields().values(),
+            self._pages[("pair-wavelength",)].output_edit,
+            self.dataset_source_page.mp_offline_db,
+        ):
+            edit.textChanged.connect(self._refresh_stability_inputs)
+        relax.dtype_combo.currentTextChanged.connect(self._refresh_stability_inputs)
+        relax.cell_check.toggled.connect(self._refresh_stability_inputs)
+        self.dataset_source_page.mp_backend.currentIndexChanged.connect(self._refresh_stability_inputs)
+
+    def _open_stability_next(self, stage: str) -> None:
+        if stage in {"11", "12"} and self.workflow.settings.get("ten_micron_profile"):
+            from ssscreen.gui.ten_micron_page import accept_cache
+
+            accept_cache(self, stage=int(stage) - 1)
+            return
+        path = STABILITY_PATHS.get(stage, ("recommend",))
+        self._show_command_page(path)
+        if stage == "12":
+            for sid in ("09", "10", "11"):
+                if STABILITY_PATHS[sid] not in self._pages:
+                    self._show_command_page(STABILITY_PATHS[sid])
+            collect = self._pages[("gap-collect-vasp",)]
+            apply_command_values(self._pages[path], {
+                "pairs_path": self._sqs_inputs()[0],
+                "gap_results_path": self._wavelength_inputs()[1],
+                "mixing_enthalpy_path": self._pages[STABILITY_PATHS["09"]].output_paths()["result"],
+                "phonons_path": self._pages[STABILITY_PATHS["10"]].output_paths()["result"],
+                "phase_stability_path": self._pages[STABILITY_PATHS["11"]].output_paths()["result"],
+            })
+            self.stack.setCurrentWidget(self._pages[path])
+        if self._active_project:
+            self._active_project.settings = self._project_settings_snapshot()
+        self._select_command_item(path)
+        self.document_label.setText(f"{stage} / {self._pages[path].presentation.title}")
+        self.statusBar().showMessage("已关联当前输入，核对本步参数与输出位置后运行。")
+
+    def _open_relaxation_mixing(self) -> None:
+        if self._active_project and self.workflow.settings.get("ten_micron_profile"):
+            from ssscreen.gui.ten_micron_page import accept_cache
+
+            accept_cache(self, stage=8)
+            return
+        page = self._pages.get(("stability", "relax"))
+        results = page.validated_result() if page else None
+        if not results or self._active_project is None:
+            return
+        self._open_stability_next("09")
+        self.statusBar().showMessage("已带入06端元对及08弛豫结果；核对输出位置后计算混合焓。")
+
+    def _open_sqs_relaxation(self) -> None:
+        if self._active_project and self.workflow.settings.get("ten_micron_profile"):
+            from ssscreen.gui.ten_micron_page import accept_cache
+
+            accept_cache(self, stage=7)
+            return
+        page = self._pages.get(("stability", "sqs-generate"))
+        manifest = page.validated_result() if page else None
+        if not manifest or self._active_project is None:
+            return
+        path = ("stability", "relax")
+        self._show_command_page(path)
+        apply_command_values(self._pages[path], {
+            "manifest_path": manifest,
+            "dataset_path": self.composition_screen_page.structures_output.text(),
+        })
+        self._active_project.settings = self._project_settings_snapshot()
+        self._select_command_item(path)
+        self.document_label.setText("08 / MACE弛豫")
+        self.statusBar().showMessage("已带入07 SQS清单及结构数据；核对模型和弛豫参数后运行08。")
+
+    def _open_wavelength_sqs(self) -> None:
+        page = self._pages.get(("pair-wavelength",))
+        output = page.validated_result() if page else None
+        if not output or self._active_project is None:
+            return
+        path = ("stability", "sqs-generate")
+        self._show_command_page(path)
+        updates = {
+            "pairs_path": output,
+            "dataset_path": self.composition_screen_page.structures_output.text(),
+        }
+        apply_command_values(self._pages[path], updates)
+        self._active_project.settings = self._project_settings_snapshot()
+        self._select_command_item(path)
+        self.document_label.setText("07 / SQS合金")
+        self.statusBar().showMessage("已带入06端元对及02结构数据；核对合金参数后运行07。")
+
+    def _select_command_item(self, path: tuple[str, ...]) -> None:
+        iterator = QTreeWidgetItemIterator(self.nav)
+        while iterator.value():
+            item = iterator.value()
+            data = item.data(0, Qt.UserRole)
+            if (
+                data and data[0] == "command" and tuple(data[2]) == path
+                and Path(data[1]).resolve() == self.project_root().resolve()
+            ):
+                item.parent().setExpanded(True)
+                self.nav.setCurrentItem(item)
+                self.nav.scrollToItem(item)
+                self._navigation_clicked(item, 0)
+                break
+            iterator += 1
+
+    def _gap_export_output(self) -> str:
+        page = self._pages.get(("gap-export",))
+        if page is not None:
+            return page.output_edit.text()
+        settings = self._active_project.settings if self._active_project else {}
+        argv = (settings or {}).get("commands", {}).get("gap-export", [])
+        if "--output" in argv:
+            return argv[argv.index("--output") + 1]
+        return "05_gap/带隙计算输入.zip"
+
+    def _gap_validation_tasks(self) -> list[str]:
+        """Reuse already registered calculation identities for CSV import."""
+        settings = self._active_project.settings if self._active_project else {}
+        argv = (settings or {}).get("commands", {}).get("gap-validate", [])
+        sources = [argv[argv.index("--tasks") + 1]] if "--tasks" in argv else []
+        values = (settings or {}).get("command_values", {}).get("gap-validate", {})
+        if values.get("tasks_path"):
+            sources.append(str(values["tasks_path"]))
+        return list(dict.fromkeys(sources))
+
+    def _use_collected_gaps(self) -> bool:
+        """Bind verified Stage 05 output to downstream forms without executing them."""
+        page = self._pages.get(("gap-collect-vasp",))
+        output = page.validated_result() if page else None
+        project = self._active_project
+        if not output or project is None:
+            return False
+        settings = project.settings if project.settings is not None else {}
+        project.settings = settings
+        overrides = settings.setdefault("command_values", {})
+        for key in ("pair-wavelength", "recommend"):
+            path = (key,)
+            command = self._command_lookup[path]
+            updates = {}
+            for option in command.params:
+                if "--gap-results" in option.opts:
+                    updates[option.name] = [output] if option.multiple else output
+                elif key != "recommend" and "--groups" in option.opts:
+                    groups = self.structure_match_page.groups_output.text()
+                    updates[option.name] = [groups] if option.multiple else groups
+            overrides.setdefault(key, {}).update(updates)
+            if path in self._pages:
+                apply_command_values(self._pages[path], updates)
+        project.settings = self._project_settings_snapshot()
+        return True
+
+    def _open_collected_gap_pairing(self) -> None:
+        if not self._use_collected_gaps():
+            return
+        self._show_command_page(("pair-wavelength",))
+        iterator = QTreeWidgetItemIterator(self.nav)
+        while iterator.value():
+            item = iterator.value()
+            data = item.data(0, Qt.UserRole)
+            if (
+                data
+                and data[0] == "command"
+                and tuple(data[2]) == ("pair-wavelength",)
+                and Path(data[1]).resolve() == self.project_root().resolve()
+            ):
+                self.nav.setCurrentItem(item)
+                self._navigation_clicked(item, 0)
+                break
+            iterator += 1
+        self.document_label.setText("06 / 按目标波长筛选端元对")
+        self.statusBar().showMessage("已带入05校验通过的带隙结果和04分组；核对目标波长后可运行配对。")
 
     # ---------------- Files / process ----------------
 
@@ -5871,6 +6851,29 @@ class MainWindow(QMainWindow):
         self.detector_assessment_page.refresh()
 
     def run_command(self, argv: list[str], title: str) -> None:
+        profile = self.workflow.settings.get("ten_micron_profile")
+        if profile:
+            from ssscreen.gui.ten_micron_page import accept_cache, validate_cache, marker
+            slow = {
+                ("condense",): 3, ("gap-export",): 5, ("gap-collect-vasp",): 5,
+                ("stability", "sqs-generate"): 7, ("stability", "relax"): 8,
+                ("stability", "phonon-run"): 10, ("stability", "phase-diagram"): 11,
+            }
+            stage = slow.get(tuple(argv[:2])) or slow.get(tuple(argv[:1]))
+            if stage:
+                self.workflow.select_stage(f"{stage:02}")
+                accept_cache(self)
+                return
+            if argv[:1] == ["recommend"]:
+                try:
+                    if not marker(self.project_root(), 11).is_file():
+                        raise ValueError("请先在 11 使用本算例的预计算结果")
+                    validate_cache(self.project_root(),profile,11)
+                except (OSError,ValueError,KeyError) as exc:
+                    QMessageBox.warning(self, "检查算例输入", str(exc))
+                    return
+        if self.workflow.export_external(argv, title):
+            return
         if self.process.state() != QProcess.NotRunning:
             QMessageBox.warning(self, "已有任务运行", "请等待当前任务结束，或先停止当前任务。")
             return
@@ -5883,6 +6886,20 @@ class MainWindow(QMainWindow):
         root = project.path
         root.mkdir(parents=True, exist_ok=True)
         (root / "logs").mkdir(exist_ok=True)
+
+        argv = list(argv)
+        self._gap_collection_run = (
+            (project.path, tuple(argv)) if argv[:1] == ["gap-collect-vasp"] else None
+        )
+        self._condense_stop_file = None
+        self._stop_requested = False
+        if argv and argv[0] == "condense":
+            if "--stop-file" in argv:
+                position = argv.index("--stop-file")
+                del argv[position : position + 2]
+            self._condense_stop_file = root / "logs" / f"condense-{uuid4().hex}.stop"
+            argv.extend(["--stop-file", str(self._condense_stop_file)])
+        self.structure_archive_page.stop_button.setEnabled(self._condense_stop_file is not None)
 
         backend_kind, backend_activate, backend_note = self._backend_for_command(argv)
         preview = self._command_preview(argv, backend_kind, backend_activate, root)
@@ -5955,20 +6972,16 @@ class MainWindow(QMainWindow):
     ) -> str:
         if backend_kind != "wsl":
             return shlex.join(["ss-screen", *argv])
-        wsl_root = self._wsl_root_for_project(root)
+        from ssscreen.gui.wsl import build_wsl_command
+
         converted = [self._windows_arg_to_wsl(value) for value in argv]
-        command = [
-            "cd",
-            shlex.quote(wsl_root),
-            "&&",
-            "source",
-            shlex.quote(backend_activate),
-            "&&",
-            "PYTHONUNBUFFERED=1",
-            "ss-screen",
-            *[shlex.quote(value) for value in converted],
-        ]
-        return "wsl.exe bash -lc " + shlex.quote(" ".join(command))
+        command = build_wsl_command(
+            self._wsl_root_for_project(root),
+            self._windows_path_to_wsl(str(root)),
+            backend_activate,
+            converted,
+        )
+        return "wsl.exe bash -lc " + shlex.quote(command)
 
     def _wsl_process(
         self,
@@ -5976,23 +6989,22 @@ class MainWindow(QMainWindow):
         root: Path,
         backend_activate: str,
     ) -> tuple[str, list[str]]:
-        key = self.api_key.text().strip()
-        exports = ["export PYTHONUNBUFFERED=1"]
-        if key:
-            exports.append(f"export MP_API_KEY={shlex.quote(key)}")
+        from ssscreen.gui.wsl import build_wsl_command
+
         converted = [self._windows_arg_to_wsl(value) for value in argv]
-        command = " && ".join(
-            [
-                f"cd {shlex.quote(self._wsl_root_for_project(root))}",
-                f"source {shlex.quote(backend_activate)}",
-                *exports,
-                shlex.join(["ss-screen", *converted]),
-            ]
+        command = build_wsl_command(
+            self._wsl_root_for_project(root),
+            self._windows_path_to_wsl(str(root)),
+            backend_activate,
+            converted,
+            api_key=self.api_key.text().strip(),
         )
         return "wsl.exe", ["bash", "-lc", command]
 
     def _wsl_root_for_project(self, root: Path) -> str:
         override = self.wsl_root.text().strip()
+        if self.workflow.settings.get("ten_micron_profile") and not override:
+            return self._windows_path_to_wsl(str(Path(__file__).resolve().parents[3]))
         if override:
             return override
         return self._windows_path_to_wsl(str(_find_project_root(root)))
@@ -6014,6 +7026,19 @@ class MainWindow(QMainWindow):
     def stop_process(self) -> None:
         if self.process.state() == QProcess.NotRunning:
             self.statusBar().showMessage("当前没有运行中的任务")
+            return
+        if self._condense_stop_file is not None:
+            try:
+                self._condense_stop_file.write_text("stop\n", encoding="utf-8")
+            except OSError as exc:
+                QMessageBox.warning(self, "停止请求未发送", str(exc))
+                return
+            self._stop_requested = True
+            self.structure_archive_page.stop_button.setEnabled(False)
+            message = "已请求停止：当前结构结束后保存记录并退出，已完成描述可供 04 使用。"
+            self.log.appendPlainText("\n[GUI] " + message)
+            self.run_state_label.setText("正在停止：等待当前结构结束…")
+            self.statusBar().showMessage(message)
             return
         self.log.appendPlainText("\n[GUI] 正在停止当前任务……")
         self.run_state_label.setText("正在停止任务…")
@@ -6061,7 +7086,7 @@ class MainWindow(QMainWindow):
         self.log.moveCursor(QTextCursor.End)
         self.log.insertPlainText(text)
         self.log.moveCursor(QTextCursor.End)
-        if self.process.state() != QProcess.NotRunning:
+        if self.process.state() != QProcess.NotRunning and not self._stop_requested:
             last_line = next(
                 (line.strip() for line in reversed(text.splitlines()) if line.strip()), ""
             )
@@ -6073,6 +7098,13 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"任务结束 · 退出码 {exit_code}")
         self.run_progress.setVisible(False)
         self.run_state_label.setText("完成" if exit_code == 0 else f"结束：退出码 {exit_code}")
+        stopped = self._condense_stop_file is not None and exit_code == 130
+        if stopped:
+            self.run_state_label.setText("已停止 · 已完成结果已保存")
+            self.statusBar().showMessage("03 已停止，已完成描述与索引已保存，可继续 04。")
+        self.structure_archive_page.stop_button.setEnabled(False)
+        self._condense_stop_file = None
+        self._stop_requested = False
 
         finished_command = self._current_run.command if self._current_run is not None else ""
 
@@ -6088,6 +7120,24 @@ class MainWindow(QMainWindow):
         self.structure_archive_page.refresh_archive()
         self.structure_match_page.refresh_inputs()
         self.structure_match_page.refresh_results()
+        if ("gap-export",) in self._pages:
+            self._pages[("gap-export",)].refresh_preview()
+        if ("gap-collect-vasp",) in self._pages:
+            collect_page = self._pages[("gap-collect-vasp",)]
+            collect_page.refresh_preview()
+            if exit_code == 0 and self._gap_collection_run == (
+                self.project_root(), tuple(collect_page.argv())
+            ):
+                if self._use_collected_gaps():
+                    self.statusBar().showMessage("05收集与校验完成，已衔接06端元配对。")
+        self._gap_collection_run = None
+        if ("pair-wavelength",) in self._pages:
+            self._pages[("pair-wavelength",)].refresh_preview()
+        if ("stability", "sqs-generate") in self._pages:
+            self._pages[("stability", "sqs-generate")].refresh_preview()
+        if ("stability", "relax") in self._pages:
+            self._pages[("stability", "relax")].refresh_preview()
+        self._refresh_stability_inputs()
         self.structure_results_page.refresh()
         self.phonon_results_page.refresh()
         self.phase_results_page.refresh()
@@ -6097,16 +7147,15 @@ class MainWindow(QMainWindow):
         self._rebuild_project_tree()
 
         if exit_code == 0 and " dataset mp " in f" {finished_command} ":
-            if self.dataset_source_page._resolve(
-                self.dataset_source_page.mp_output.text()
-            ).exists():
+            mp_path = self.dataset_source_page._resolve(self.dataset_source_page.mp_output.text())
+            if mp_path.is_file():
+                self.composition_screen_page._append_dataframe(mp_path)
+                self.composition_screen_page.refresh_inputs()
                 self.dataset_source_page.select_section("local")
                 self.stack.setCurrentWidget(self.dataset_source_page)
 
         if exit_code == 0 and " dataset wbm " in f" {finished_command} ":
-            if self.dataset_source_page._resolve(
-                self.dataset_source_page.wbm_output.text()
-            ).exists():
+            if self.dataset_source_page._resolve(self.dataset_source_page.wbm_output.text()).exists():
                 self.dataset_source_page.select_section("local")
                 self.stack.setCurrentWidget(self.dataset_source_page)
 
@@ -6131,6 +7180,18 @@ class MainWindow(QMainWindow):
         if exit_code == 0 and " recommend " in f" {finished_command} ":
             self.recommendation_report_page.refresh()
             self.stack.setCurrentWidget(self.recommendation_report_page)
+
+        if exit_code == 0 and " geometry-evaluate " in f" {finished_command} ":
+            self.detector_assessment_page.refresh()
+            self.stack.setCurrentWidget(self.detector_assessment_page)
+
+        if self._handoff_after_stop:
+            self._handoff_after_stop = False
+            if stopped or exit_code == 0:
+                self._use_completed_condense()
+        if self._close_after_stop:
+            self._close_after_stop = False
+            self.close()
 
     def _write_run_audit(self, record: RunRecord) -> None:
         path = self.project_root() / "logs" / "gui_commands.jsonl"
@@ -6165,6 +7226,11 @@ class MainWindow(QMainWindow):
             QMessageBox.No,
         )
         if answer == QMessageBox.Yes:
+            if self._condense_stop_file is not None:
+                self._close_after_stop = True
+                self.stop_process()
+                event.ignore()
+                return
             self.stop_process()
             event.accept()
         else:
@@ -6179,6 +7245,22 @@ class MainWindow(QMainWindow):
 
     def _refresh_font_layout(self, _index: int = 0) -> None:
         adapt_font_layout(self, self._font_size)
+        if hasattr(self, "stack"):
+            # Inactive plot pages have wide minimum hints. The compact collector
+            # must fit the visible viewport instead of inheriting their width.
+            policy = self.stack.sizePolicy()
+            policy.setVerticalPolicy(
+                QSizePolicy.Ignored
+                if isinstance(self.stack.currentWidget(), PhaseResultsPage)
+                else QSizePolicy.Preferred
+            )
+            policy.setHorizontalPolicy(
+                QSizePolicy.Ignored
+                if isinstance(self.stack.currentWidget(), (GapCollectPage, WavelengthPairPage, SqsPage, RelaxPage, StabilityPage, PhaseResultsPage))
+                else QSizePolicy.Preferred
+            )
+            self.stack.setSizePolicy(policy)
+            self.stack.updateGeometry()
         if hasattr(self, "inspector"):
             for form in self.inspector.findChildren(QFormLayout):
                 form.setRowWrapPolicy(QFormLayout.WrapAllRows)
@@ -6523,6 +7605,10 @@ def run_gui(project_dir: str | None = None) -> int:
     if app is None:
         QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
         app = QApplication([sys.argv[0]])
+    if os.name == "nt" and not QFontDatabase.families():
+        for filename in ("segoeui.ttf", "msyh.ttc", "consola.ttf"):
+            QFontDatabase.addApplicationFont(str(Path(os.environ["WINDIR"]) / "Fonts" / filename))
+        app.setFont(QFont("Microsoft YaHei UI", DEFAULT_FONT_SIZE))
     app.setApplicationName("SS-Screen")
     window = MainWindow(project_dir=project_dir)
     window.show()

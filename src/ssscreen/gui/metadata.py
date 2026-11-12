@@ -11,6 +11,12 @@ from dataclasses import dataclass
 from typing import Any
 
 OPTION_LABELS_ZH: dict[str, str] = {
+    "wavelength_um": "目标波长（μm）",
+    "min_gap_exclusive": "端元带隙严格下限（eV，排除等号）",
+    "max_gap_exclusive": "端元带隙严格上限（eV，排除等号）",
+    "allow_mixed_methods": "保留混合带隙方法（标记待核验）",
+    "groups_paths": "结构分组文件（可多选）",
+    "gap_paths": "带隙结果文件（可多选）",
     "input": "输入文件",
     "input_dir": "输入目录",
     "output": "输出文件",
@@ -132,7 +138,7 @@ STAGES: tuple[tuple[str, str, str], ...] = (
     ("10", "声子谱", "10_phonon"),
     ("11", "竞争相 / 凸包", "11_phase"),
     ("12", "综合推荐", "12_recommend"),
-    ("13", "探测器性能评估", "13_detector"),
+    ("13", "候选材料评价", "13_geometry"),
 )
 
 
@@ -147,17 +153,16 @@ COMMANDS: tuple[CommandPresentation, ...] = (
     CommandPresentation("03", "校验结构描述归档", ("condense-validate",)),
     CommandPresentation("04", "执行结构匹配", ("structure-match",)),
     CommandPresentation("04", "兼容一步式分组", ("group",)),
-    CommandPresentation("05", "导出高精度带隙任务", ("gap-export",)),
-    CommandPresentation("05", "收集 VASP 带隙结果", ("gap-collect-vasp",)),
-    CommandPresentation("05", "校验外部带隙结果", ("gap-validate",)),
-    CommandPresentation("06", "生成端元对", ("pair",)),
-    CommandPresentation("06", "比较带隙方法", ("gap-compare",)),
+    CommandPresentation("05", "导出带隙计算压缩包", ("gap-export",)),
+    CommandPresentation("05", "收集 / 导入带隙结果", ("gap-collect-vasp",)),
+    CommandPresentation("06", "按目标波长筛选端元对", ("pair-wavelength",)),
     CommandPresentation("07", "生成 SQS", ("stability", "sqs-generate")),
     CommandPresentation("08", "MACE 结构驰豫", ("stability", "relax")),
     CommandPresentation("09", "混合焓计算", ("stability", "mixing-enthalpy")),
     CommandPresentation("10", "声子谱一步式运行", ("stability", "phonon-run")),
     CommandPresentation("11", "竞争相与凸包一步式运行", ("stability", "phase-diagram")),
     CommandPresentation("12", "综合推荐", ("recommend",)),
+    CommandPresentation("13", "几何计算输入与配置", ("geometry-evaluate",)),
 )
 
 
@@ -182,9 +187,10 @@ PATH_PRESETS: dict[tuple[str, ...], dict[str, Any]] = {
         "--df": ("01_dataset/mp.df",),
         "--output": "02_composition/composition_candidates.csv",
         "--summary": "02_composition/composition_summary.json",
+        "--structures-output": "02_composition/candidates.df",
     },
     ("condense",): {
-        "--df": "01_dataset/local_structures.df",
+        "--df": "02_composition/candidates.df",
         "--output-dir": "03_condensed/local",
         "--manifest": "03_condensed/local_manifest.jsonl",
         "--index": "03_condensed/local_index.csv",
@@ -224,25 +230,11 @@ PATH_PRESETS: dict[tuple[str, ...], dict[str, Any]] = {
         "--output": "05_gap/results_returned.csv",
         "--report": "05_gap/collection-report.json",
     },
-    ("gap-validate",): {
-        "--gaps": "05_gap/results_returned.csv",
-        "--tasks": "05_gap/tasks.csv",
-        "--method-metadata": "05_gap/method_metadata.json",
-        "--output": "05_gap/results_normalized.csv",
-        "--rejected": "05_gap/results_rejected.csv",
-        "--report": "05_gap/validation.json",
-    },
-    ("pair",): {
-        "--groups": "04_groups/groups.json",
-        "--gap-results": ("05_gap/results_normalized.csv",),
-        "--summary": "06_pair/pair_summary.json",
+    ("pair-wavelength",): {
+        "--groups": ("04_groups/groups.json",),
+        "--gap-results": ("05_gap/results_returned.csv",),
         "--output": "06_pair/final_pairs.csv",
-    },
-    ("gap-compare",): {
-        "--groups": "04_groups/groups.json",
-        "--gap-results": ("05_gap/results_normalized.csv",),
-        "--output-dir": "06_pair/gap_compare",
-        "--summary": "06_pair/gap_compare_summary.json",
+        "--summary": "06_pair/summary.json",
     },
     ("stability", "sqs-generate"): {
         "--pairs": "06_pair/final_pairs.csv",
@@ -345,7 +337,7 @@ PATH_PRESETS: dict[tuple[str, ...], dict[str, Any]] = {
     },
     ("recommend",): {
         "--pairs": "06_pair/final_pairs.csv",
-        "--gap-results": "05_gap/results_normalized.csv",
+        "--gap-results": "05_gap/results_returned.csv",
         "--mixing-enthalpy": "09_mixing/mixing_enthalpy.csv",
         "--phonons": "10_phonon/phonon_summary.csv",
         "--phase-stability": "11_phase/phase_stability.csv",

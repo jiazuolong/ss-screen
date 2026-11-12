@@ -113,6 +113,24 @@ def test_group_missing_env_never_matches(cese2_condensed):
     assert groups == []
 
 
+def test_spectator_fingerprint_is_sorted_after_variable_substitution():
+    """Equivalent environments must match despite opposite iteration order."""
+    envs = [
+        [
+            "CaS",
+            {"Ca": [("S4", "tetrahedral"), ("S6", "octahedral")], "S": {("Ca6", "octahedral")}},
+        ],
+        [
+            "CaSe",
+            {"Ca": [("Se6", "octahedral"), ("Se4", "tetrahedral")], "Se": {("Ca6", "octahedral")}},
+        ],
+    ]
+    groups = group_similar_structures(envs, "CaX", ["a", "b"])
+    assert len(groups) == 1
+    assert groups[0].mp_ids == ["a", "b"]
+    assert groups[0].X_element == ["S", "Se"]
+
+
 # ---------------------------------------------------------------------------
 # StructureGroup dataclass
 # ---------------------------------------------------------------------------

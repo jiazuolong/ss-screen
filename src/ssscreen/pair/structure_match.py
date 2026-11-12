@@ -40,6 +40,13 @@ def match_structure_candidates(
     """
     df = pd.read_csv(candidates) if not isinstance(candidates, pd.DataFrame) else candidates.copy()
     loader = CondenseLoader(condensed_dirs)
+    candidate_ids = set(df["material_id"].astype(str))
+    # Freeze membership at startup so a concurrently growing Stage 03 archive
+    # cannot change the input population halfway through this run.
+    snapshot_ids = {
+        path.stem for directory in condensed_dirs for path in Path(directory).glob("*.json")
+    } & candidate_ids
+    loaded_ids: set[str] = set()
 
     all_groups: list[StructureGroup] = []
     raw_group_count = 0
@@ -54,16 +61,20 @@ def match_structure_candidates(
         condensed = []
         for entry in entries:
             material_id = entry[0]
-            item = loader.get_condensed(material_id)
-            if item is None:
+            if material_id not in snapshot_ids:
                 missing_material_ids.append(material_id)
                 continue
             try:
+                item = loader.get_condensed(material_id)
+                if item is None:
+                    missing_material_ids.append(material_id)
+                    continue
                 find_unique_envs([item])
             except Exception as exc:
                 invalid_material_ids.append(material_id)
                 invalid_errors[material_id] = str(exc)
                 continue
+            loaded_ids.add(material_id)
             valid_entries.append(entry)
             material_ids.append(material_id)
             condensed.append(item)
@@ -93,5 +104,13 @@ def match_structure_candidates(
         "group_count": int(len(all_groups)),
         "grouped_members": int(sum(group.group_size for group in all_groups)),
         "min_x_elements": int(min_x_elements),
+        "candidate_materials": len(candidate_ids),
+        "available_materials": len(loaded_ids),
+        "available_material_ids": sorted(loaded_ids),
+        "missing_materials": len(set(missing_material_ids)),
+        "invalid_materials": len(set(invalid_material_ids)),
+        "description_coverage": len(loaded_ids) / len(candidate_ids) if candidate_ids else 0.0,
+        "partial_run": bool(missing_material_ids or invalid_material_ids),
+        "condensed_dirs": [str(directory) for directory in condensed_dirs],
     }
     return all_groups, report
