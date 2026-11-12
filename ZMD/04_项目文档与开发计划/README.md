@@ -1,5 +1,7 @@
 # 项目文档与开发计划导航
 
+- [仓库首页](../../README.md) 和 [复现说明](../../docs/reproducibility/demo_v1_delivery.md) 提供 clone 后在 PowerShell 或 Ubuntu WSL 中启动演示的命令。
+
 真实目录：[`docs/`](../../docs/) 和 [`plans/`](../../plans/)
 
 ## 当前权威文档
