@@ -82,6 +82,9 @@ Documentation = "https://github.com/bonan/HC/ss-screen/docs/PROJECT_PLAN.md"
 [tool.hatch.build.targets.wheel]
 packages = ["src/ssscreen"]
 
+[tool.uv]
+cache-keys = [{ file = "pyproject.toml" }, { file = ".gitignore" }, { file = "src/ssscreen/**/*.py" }]
+
 [tool.ruff]
 line-length = 100
 target-version = "py310"

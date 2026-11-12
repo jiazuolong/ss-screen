@@ -1,5 +1,7 @@
 # 脚本与自动化导航
 
+- Windows 启动器使用 .NET 核验 uv 下载，公开仓库克隆验收覆盖 Windows wheel 内的数据读取模块及 GUI 到 WSL 的 01 命令连接。
+
 - [Windows 启动入口](../../start-10um.cmd) 和 [WSL 启动入口](../../scripts/start-10um.sh) 调用 [环境引导脚本](../../scripts/start-10um.ps1) 及 [工作区准备脚本](../../scripts/start_10um.py)。从公开 Release 获取校验过的数据，在命令执行目录创建 ss-screen-10um，使用独立 Windows/WSL 环境打开 01 页。
 
 真实目录：[`scripts/`](../../scripts/) 和 [`.github/`](../../.github/)
