@@ -8,6 +8,10 @@ isostructural prototype groups in large materials databases (Materials Project,
 WBM) where one endmember is near-zero-gap and another is a small direct-gap
 semiconductor — candidates for gap tuning via alloying.
 
+## 10.0 μm GUI 演示
+
+[下载演示工程与数据库](https://github.com/jiazuolong/ss-screen/releases/tag/demo-10um-20261112) · [安装与逐步验收说明](docs/reproducibility/demo_v1_delivery.md)
+
 ## Scientific core
 
 Materials are grouped by a **robocrystallographer local-environment fingerprint**
@@ -18,10 +22,13 @@ small direct-gap member.
 
 ## Install
 
+The core package supports Python 3.10+. Use Python 3.11 or newer for the
+`condense` extra: its required `matminer>=0.10.1` dependency requires Python 3.11+.
+
 ```bash
 pip install -e .
-# Ubuntu development setup for the CLI plus common workflow extras and GUI:
-pip install -r requirements.txt
+# CLI plus structure descriptions, MP access and development tools:
+python -m pip install -e ".[condense,mp]" --group dev
 # To query Materials Project directly with --backend api:
 pip install -e ".[mp]"
 # To use a local Materials Project SQLite snapshot (separate package):
@@ -39,6 +46,20 @@ ss-screen-gui
 pip install torch==2.5.1+cu121 --index-url https://download.pytorch.org/whl/cu121
 pip install -e ".[mlp,phonon]"
 ```
+
+To start with the original **MP ZIP** and recompute candidates/groups before
+producing the 318 mBJ pairs, use `ss-screen mp-reproduce --mp-zip ... --mbj-bundle ... --output-dir ...`.
+Follow [MP ZIP → 318 pairs](docs/reproducibility/MP_ZIP_TO_318_ZH.md): this route
+needs the original database, offline reader, and existing mBJ results. It calculates
+robocrys descriptors afresh by default; a separately verified cache is opt-in.
+The [historical protocol notes](docs/reproducibility/mp_2944_20261104.md) explain provenance.
+To replay only the 318 pairs from a separately supplied data ZIP, follow the
+[Chinese quickstart](docs/reproducibility/REPLAY_318_ZH.md) and use
+`scripts/replay_mbj_results.py`; the original MP database and MACE are not needed.
+The [observed environment constraints](requirements/reproduction-20261104/README.md)
+separate screening, CPU MACE/Phonopy, and Windows GUI environments. Database
+snapshots, computed band gaps, and model weights are separate assets; cloning
+this repository does not download them or run electronic-structure calculations.
 
 ## CLI
 
@@ -219,6 +240,12 @@ ss-screen recommend \
   --report recommendation_report.md \
   --summary recommendation_summary.json
 
+# Stage 13: compare endmember lattices and search local substrate matches
+ss-screen geometry-evaluate \
+  --input 13_geometry/input \
+  --config 13_geometry/config.json \
+  --output 13_geometry
+
 # Legacy notebook-style gap CSVs are still accepted:
 ss-screen pair --groups group_df.json --gaps mbj_gaps.csv --output mbj_result.csv
 ```
@@ -231,6 +258,58 @@ one JSON file per material (`condensed/{material_id}.json`) so multiple workers
 can read, skip, and write independent files concurrently; manifest/index CSV
 sidecars provide searchable metadata without replacing the per-material files.
 High-level band-gap calculations are deliberately external to `ss-screen`.
+The Stage 05 GUI offers two input paths (Stage 04 groups and the structure
+DataFrame) and one ZIP output. The equivalent portable export is:
+
+```bash
+ss-screen gap-export --bundle --groups 04_groups/groups.json \
+  --dataset 02_composition/candidates.df --output 05_gap/gap_inputs.zip
+```
+
+The ZIP contains task tables, JSON/CIF/POSCAR structures with relative paths,
+result and method templates, the input groups, a skip list, source/file hashes,
+and handoff instructions. It retains the existing 30-atom default export limit;
+the GUI states this scope and a saved limit is preserved. No method needs to be
+chosen in this export form. For VASP returns, keep the original exported task IDs
+as directory names: `VASP-results/gap-TASK-ID/vasprun.xml[.gz]`. The collection GUI
+offers **VASP原始计算文件** or **整理好的CSV文件**, with one active input path
+and one output folder. In VASP mode it automatically uses the
+project export, records actual method/settings and geometry from XML, and saves
+the linked task table for validation. Unknown task IDs and extra directory levels
+are rejected. The equivalent CLI is:
+
+```bash
+ss-screen gap-collect-vasp --task-source 05_gap/gap_inputs.zip \
+  --results-dir VASP-results --output 05_gap/results_returned.csv
+```
+
+For a prepared CSV, the GUI automatically associates the project's registered
+calculation records and validates task/material/method/structure identities and
+gap values before import. Select a CSV in the software's result format; no task
+table needs to be selected in the GUI. The equivalent CLI with an already
+registered task table is:
+
+```bash
+ss-screen gap-collect-vasp --task-source prepared/tasks.csv \
+  --results-csv prepared/results.csv --output 05_gap/results_returned.csv
+```
+
+Choose one of `--results-dir` and `--results-csv`. CSV import preserves calculation
+statuses, marks absent tasks as missing, and does not reparse XML. Both modes save
+the result table, report and automatic task/provenance sidecars, protecting
+existing output files. In the GUI, **收集 / 导入带隙结果** now includes validation
+for both input modes. Its validated `results_returned.csv` goes directly to
+Stage 06 through **进入06端元配对**; the separate GUI validation entry is removed.
+Successful collection fills the pairing input automatically without starting
+pairing. Records without successful gaps remain visible, and the handoff is
+disabled when no successful gap is available. The standalone `gap-validate`
+CLI remains available for independent checks and existing scripts.
+
+`prepare_calculation.py` remains available for explicit task/CSV handoffs from
+other external workflows. This exports material inputs, not a configured DFT job
+or calculated gaps. Existing ZIPs are never
+overwritten; choose a new output name for another export.
+
 `gap-export` assigns deterministic task IDs and structure hashes and writes
 JSON/CIF/POSCAR structures plus result/method templates. `gap-collect-vasp`
 batch-parses `task_id/vasprun.xml[.gz]` directories, and `gap-validate`
@@ -281,6 +360,13 @@ opaque aggregate scientific score. Defect evidence can be supplied when
 available and is optional unless `--require-defects` is selected. The default
 mixing-enthalpy and same-MLIP hull thresholds are configurable triage values,
 not universal stability criteria.
+Stage 13 compares endmember lattice correspondence and evaluates one explicitly
+selected relaxed alloy SQS (default seed101) against a user-supplied local
+substrate library. It reports ZSL supercell matches and in-plane principal
+engineering strain, while reusing existing property evidence without launching
+DFT/MLP/phonon calculations. Its finite search is geometric screening evidence,
+not proof of epitaxy, synthesizability, or device performance; see
+`docs/lattice_substrate_matching_development.md`.
 
 ## Documentation
 
@@ -289,6 +375,7 @@ not universal stability criteria.
 - `docs/algorithm_gap_backfill_pairing.md` — external gap contract and pair algorithm
 - `docs/algorithm_competing_phase_hull.md` — Stage 10 MP/MLIP hull contract
 - `docs/algorithm_recommendation.md` — Stage 11 recommendation and evidence contract
+- `docs/lattice_substrate_matching_development.md` — Stage 13 lattice, substrate matching, strain, and file contract
 - `AGENTS.md` — operating rules for AI assistants (read-only boundaries)
 - `references/README.md` — curated historical notebooks/source with executed results
 - `references/manifest.json` — machine-readable provenance, hashes, aliases, redactions, and exclusions

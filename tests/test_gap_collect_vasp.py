@@ -208,3 +208,40 @@ def test_parse_vasprun_extracts_converged_gap(monkeypatch, tmp_path):
         transition="G-X",
         backend_version="6.4.3",
     )
+
+
+def test_collect_preserves_per_task_settings_without_single_metadata(tmp_path):
+    tasks = tmp_path / "tasks.csv"
+    _write_tasks(tasks)
+    frame = pd.read_csv(tasks)
+    frame["settings_sha256"] = ["a" * 64, "b" * 64, ""]
+    frame.to_csv(tasks, index=False)
+    results_dir = tmp_path / "results"
+    results_dir.mkdir()
+    results, _ = collect_vasp_gap_results(
+        tasks_path=tasks, results_dir=results_dir, output_path=tmp_path / "collected.csv"
+    )
+    assert list(results["settings_sha256"]) == ["a" * 64, "b" * 64, ""]
+    assert list(results["status"]) == ["missing"] * 3
+    assert results["band_gap"].isna().all()
+
+
+def test_collect_rejects_metadata_that_would_replace_task_settings(tmp_path):
+    tasks = tmp_path / "tasks.csv"
+    _write_tasks(tasks)
+    frame = pd.read_csv(tasks)
+    frame["settings_sha256"] = "a" * 64
+    frame.to_csv(tasks, index=False)
+    results_dir = tmp_path / "results"
+    results_dir.mkdir()
+    metadata = tmp_path / "method_metadata.json"
+    metadata.write_text(json.dumps({"method": "vasp-hse06-v1", "settings": {"ENCUT": 520}}))
+    output = tmp_path / "collected.csv"
+    with pytest.raises(ValueError, match="settings do not match"):
+        collect_vasp_gap_results(
+            tasks_path=tasks,
+            results_dir=results_dir,
+            output_path=output,
+            method_metadata_path=metadata,
+        )
+    assert not output.exists()

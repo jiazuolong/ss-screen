@@ -235,6 +235,10 @@ def generate_sqs_inputs(
     _validate_target_fractions(target_fractions)
     generator = "icet-generate_sqs_from_supercells" if backend == "icet" else "random-substitution"
     pairs = _load_pairs(pairs_path)
+    input_sha256 = {
+        "pairs": _sha256_file(Path(pairs_path)),
+        "dataset": _sha256_file(Path(dataset_path)),
+    }
     dataset = pd.read_pickle(dataset_path)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -328,4 +332,19 @@ def generate_sqs_inputs(
             records.append(record)
 
     _write_manifest(records, manifest_path)
+    provenance = {
+        "input_sha256": input_sha256,
+        "parameters": {
+            "target_fractions": list(target_fractions),
+            "supercell": list(supercell),
+            "seed": seed,
+            "backend": backend,
+            "cutoffs": list(cutoffs),
+            "sqs_steps": sqs_steps,
+        },
+        "manifest_sha256": _sha256_file(Path(manifest_path)),
+    }
+    Path(manifest_path).with_suffix(".provenance.json").write_text(
+        json.dumps(provenance, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     return records

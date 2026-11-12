@@ -36,6 +36,7 @@ def load_gap_results(
     gap_paths: Sequence[str | Path],
     *,
     method: str | None = None,
+    allow_mixed_methods: bool = False,
 ) -> tuple[pd.DataFrame, dict[str, list], dict]:
     """Load external gap-result tables and build a material-id gap map.
 
@@ -62,14 +63,18 @@ def load_gap_results(
 
     raw = pd.concat(frames, ignore_index=True)
     methods = sorted(raw["method"].dropna().astype(str).unique())
-    if method is None:
+    if method is not None and allow_mixed_methods:
+        raise ValueError("method and allow_mixed_methods are mutually exclusive")
+    if method is None and not allow_mixed_methods:
         if len(methods) > 1:
             raise ValueError(
                 "multiple gap methods present; pass --method to select one: " + ", ".join(methods)
             )
         method = methods[0] if methods else ""
 
-    selected = raw.loc[raw["method"].astype(str) == method].copy()
+    selected = (
+        raw.copy() if allow_mixed_methods else raw.loc[raw["method"].astype(str) == method].copy()
+    )
     success_mask = selected["status"].str.lower().isin(SUCCESS_STATUSES)
     successful = selected.loc[success_mask].copy()
     duplicate_rows = int(successful.duplicated(subset=["material_id"], keep=False).sum())
@@ -83,7 +88,8 @@ def load_gap_results(
     report = {
         "gap_files": [str(path) for path in gap_paths],
         "methods": methods,
-        "selected_method": method,
+        "selected_method": "mixed_sources" if allow_mixed_methods else method,
+        "allow_mixed_methods": allow_mixed_methods,
         "gap_rows": int(len(raw)),
         "selected_gap_rows": int(len(selected)),
         "successful_gap_rows": int(len(successful)),

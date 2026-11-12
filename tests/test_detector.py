@@ -1,77 +1,82 @@
-"""Regression checks for Stage 13 screening-only detector indicators."""
-
-import csv
-import math
-
+"""Stage 13 no fabricated device metrics and strict geometry identity joins."""
 import pytest
-
-from ssscreen.detector import (
-    DEMO_DEVICE_ROWS, DEMO_ROWS, PHOTON_ENERGY_EV_UM, assess_candidate, assess_rows,
-    export_rows, index_measurements, read_csv,
-)
+from ssscreen.detector import assess_candidate, assess_rows, export_rows, read_csv, index_geometry, DEMO_ROWS
 
 
-def test_linear_endmember_estimate_and_cutoff():
-    result = assess_candidate(
-        {"recommendation_id": "test-1", "gap_a_eV": "0.4", "gap_b_eV": "0.8",
-         "actual_fraction_b": "0.5"}, 2.0
-    )
-    assert result["gap_eV"] == pytest.approx(0.6)
-    assert result["cutoff_um"] == pytest.approx(PHOTON_ENERGY_EV_UM / 0.6)
-    assert result["band_match"] == "带隙覆盖"
-    assert "线性插值" in result["gap_origin"]
-    assert result["responsivity_A_W"] is None
+def test_demo_gap_only_and_missing_geometry(tmp_path):
+    rows=assess_rows(list(DEMO_ROWS),2.0,data_origin='内置演示（非真实材料）')
+    assert len(rows)==3
+    assert rows[0]['gap_a_eV']==pytest.approx(.38)
+    assert rows[0]['gap_b_eV']==pytest.approx(.72)
+    assert rows[0]['alloy_gap_eV'] is None
+    assert rows[0]['gap_equivalent_wavelength_um'] is None
+    assert rows[0]['target_gap_eV']==pytest.approx(1.239841984/2.0)
+    assert rows[0]['band_match']=='端元范围覆盖'
+    assert rows[0]['candidate_grade']=='演示数据（不可评级）'
+    assert rows[0]['phonon_min_THz'] is None
+    assert rows[0]['mixing_enthalpy_meV_atom'] is None
+    assert rows[0]['substrate_principal_strain_pct'] is None
+    assert '演示数据' in rows[0]['candidate_grade']
+    path=tmp_path/'stage13.csv';export_rows(path,rows)
+    saved=read_csv(path)
+    assert 'responsivity_A_W' not in saved[0]
+    assert 'lattice_mismatch_pct' in saved[0]
 
 
-def test_supplied_alloy_gap_takes_precedence():
-    result = assess_candidate(
-        {"pair_index": "2", "alloy_gap_eV": "0.2", "gap_a_eV": "0.5",
-         "gap_b_eV": "0.9", "target_fraction_b": "0.5"}, 8.0
-    )
-    assert result["gap_eV"] == 0.2
-    assert result["band_match"] == "带隙不覆盖"
-    assert "输入合金带隙" in result["gap_origin"]
+def test_conservative_status_and_conversion():
+    result=assess_candidate({'recommendation_id':'C1','actual_fraction_b':'0.5',
+        'mixing_status':'success','mixing_enthalpy_meV_per_atom':'12',
+        'phonon_status':'success','minimum_mesh_frequency_THz':'-0.03',
+        'phase_status':'success','energy_above_hull_eV_per_atom':'0.015'},2.0)
+    assert result['mixing_enthalpy_meV_atom']==12
+    assert result['phonon_min_THz']==-.03
+    assert result['energy_above_hull_meV_atom']==15
+    assert result['candidate_grade']=='次优'
+    assert result['material_grade']=='待补充'
 
 
-def test_no_gap_when_fraction_missing_or_nonfinite():
-    for fraction in ("", "nan", "Infinity", "-0.2", "2.0"):
-        result = assess_candidate(
-            {"gap_a_eV": "0.2", "gap_b_eV": "0.5", "target_fraction_b": fraction},
-            2.0,
-        )
-        assert result["gap_eV"] is None
-        assert result["band_match"] == "待补充带隙"
+def test_geometry_matches_exact_id_and_composition():
+    data={'candidate_id':'C1','actual_fraction_b':'0.5','lattice_mismatch_pct':'1.98',
+          'phonon_min_THz':'0.12','mixing_enthalpy_meV_atom':'20',
+          'energy_above_hull_meV_atom':'10','substrate_principal_strain_pct':'0.9',
+          'candidate_grade':'优先进一步验证','geometry_grade':'几何优先'}
+    result=assess_candidate({'recommendation_id':'C1','target_fraction_b':'0.5',
+                             'alloy_gap_eV':'0.4'},2.0,data)
+    assert result['lattice_mismatch_pct']==1.98
+    assert result['substrate_principal_strain_pct']==.9
+    with pytest.raises(ValueError,match='fraction'):
+        assess_candidate({'recommendation_id':'C1','target_fraction_b':'0.3'},2.0,data)
+    with pytest.raises(ValueError,match='Duplicate'):
+        index_geometry([data,data])
 
 
-def test_external_device_values_are_not_invented():
-    measurements = index_measurements([{
-        "recommendation_id": "test-a", "responsivity_A_W": "0.8", "area_cm2": "0.01",
-        "nep_W_sqrtHz": "1e-12", "dark_current_A": "", "rise_time_ms": "0.4",
-    }])
-    assessed = assess_rows([{"recommendation_id": "test-a"}], 2.0, measurements)[0]
-    assert assessed["responsivity_A_W"] == 0.8
-    assert assessed["dark_current_A"] is None
-    assert assessed["detectivity_jones"] == pytest.approx(1e11)
-    assert assessed["device_data_source"] == "外部提供的器件数据"
+def test_endmember_gaps_are_not_interpolated_as_alloy_gap():
+    data={'candidate_id':'C2','actual_fraction_b':'0.5','candidate_grade':'优先进一步验证'}
+    r=assess_candidate({'recommendation_id':'C2','gap_a_eV':'.4','gap_b_eV':'.6',
+                        'actual_fraction_b':'.5'},2.2,data)
+    assert r['gap_a_eV']==.4
+    assert r['gap_b_eV']==.6
+    assert r['alloy_gap_eV'] is None
+    assert r['endpoint_gap_min_eV']==.4
+    assert r['endpoint_gap_max_eV']==.6
+    assert r['band_match']=='端元范围覆盖'
 
 
-def test_invalid_target_wavelength():
-    for target in (0, -1, float("nan"), float("inf")):
-        with pytest.raises(ValueError):
-            assess_candidate({}, target)
+def test_target_outside_endmember_gap_interval():
+    result=assess_candidate({'gap_a_eV':'.4','gap_b_eV':'.6'},2.0)
+    assert result['band_match']=='端元范围未覆盖'
+    assert result['candidate_grade']=='次优'
 
 
-def test_demo_flag_and_export(tmp_path):
-    rows = assess_rows(
-        list(DEMO_ROWS), 2.0, index_measurements([dict(r) for r in DEMO_DEVICE_ROWS]),
-        data_origin="内置演示（非真实材料）",
-    )
-    assert len(rows) == 3
-    assert all(row["data_origin"] == "内置演示（非真实材料）" for row in rows)
-    output = tmp_path / "13_detector" / "assessed.csv"
-    export_rows(output, rows)
-    parsed = read_csv(output)
-    assert len(parsed) == 3
-    assert parsed[0]["candidate_id"] == "DEMO-001"
-    assert parsed[0]["responsivity_A_W"] == "0.8"
-    assert parsed[0]["device_data_source"] == "内置虚构器件指标（仅演示）"
+def test_endpoint_range_coverage_is_priority_without_alloy_gap():
+    result=assess_candidate({'gap_a_eV':'.01','gap_b_eV':'.8'},2.0)
+    assert result['alloy_gap_eV'] is None
+    assert result['band_match']=='端元范围覆盖'
+    assert result['candidate_grade']=='优先'
+    assert result['material_grade']=='待补充'
+
+
+def test_nonfinite_and_zero_gap():
+    for bad in (0,-1,float('nan'),float('inf')):
+        with pytest.raises(ValueError):assess_candidate({},bad)
+    assert assess_candidate({'alloy_gap_eV':'0'},2)['alloy_gap_eV'] is None

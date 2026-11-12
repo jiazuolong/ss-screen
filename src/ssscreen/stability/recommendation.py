@@ -356,11 +356,19 @@ def _evaluate_gap_evidence(
                 "complete": False,
             }
 
-    selected = gaps.loc[gaps["method"].astype(str) == method]
+    mixed_sources = method == "mixed_sources"
+    if mixed_sources:
+        # Pair generation explicitly records the authorized source for each endmember.
+        # Source coverage does not establish equivalence of the two methods.
+        assessment.add_risk("gap:mixed_sources", uncertain=True)
     result: dict[str, Any] = {"gap_method": method, "complete": True}
     result_status = "complete"
     direct_values: list[bool | None] = []
     for endpoint, material_id in zip(("a", "b"), endpoint_ids, strict=True):
+        endpoint_method = (
+            _clean_text(pair.get(f"gap_method_{endpoint}")) if mixed_sources else method
+        )
+        selected = gaps.loc[gaps["method"].astype(str) == endpoint_method]
         rows = selected.loc[selected["material_id"].astype(str) == str(material_id)]
         if rows.empty:
             assessment.add_missing(f"gap:{endpoint}:missing_source")

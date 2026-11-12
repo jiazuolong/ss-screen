@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -87,6 +88,46 @@ def test_generate_sqs_inputs_writes_structures_and_manifest(tmp_path):
     rows = [json.loads(line) for line in manifest.read_text().splitlines()]
     assert rows == records
 
+    from ssscreen.gui.sqs_results import file_sha256, sqs_result_status
+
+    provenance_path = manifest.with_suffix(".provenance.json")
+    provenance = json.loads(provenance_path.read_text())
+    assert provenance["input_sha256"] == {
+        "pairs": file_sha256(pairs_path),
+        "dataset": file_sha256(dataset_path),
+    }
+    assert provenance["manifest_sha256"] == file_sha256(manifest)
+
+    def status(parameters=None):
+        return sqs_result_status(
+            tmp_path,
+            str(pairs_path),
+            str(dataset_path),
+            str(output_dir),
+            str(manifest),
+            parameters or provenance["parameters"],
+        )
+
+    assert status()["ready"]
+    assert not status({**provenance["parameters"], "seed": 8})["ready"]
+    for changed in (
+        pairs_path,
+        dataset_path,
+        manifest,
+        Path(record["structure_path"]),
+        Path(record["endpoint_a_structure_path"]),
+    ):
+        original = changed.read_bytes()
+        changed.write_bytes(original + b"\n")
+        assert not status()["ready"], changed
+        changed.write_bytes(original)
+    assert status()["ready"]
+    original_provenance = provenance_path.read_bytes()
+    provenance_path.unlink()
+    assert not status()["ready"]
+    provenance_path.write_bytes(original_provenance)
+    assert status()["ready"]
+
 
 def test_generate_sqs_inputs_records_skipped_pairs(tmp_path):
     pairs_path = tmp_path / "pairs.csv"
@@ -114,6 +155,18 @@ def test_generate_sqs_inputs_records_skipped_pairs(tmp_path):
 
     assert records[0]["status"] == "skipped"
     assert "single-site substitution" in records[0]["limitation"]
+    from ssscreen.gui.sqs_results import sqs_result_status
+
+    report = json.loads(manifest.with_suffix(".provenance.json").read_text())
+    status = sqs_result_status(
+        tmp_path,
+        str(pairs_path),
+        str(dataset_path),
+        str(tmp_path / "sqs"),
+        str(manifest),
+        report["parameters"],
+    )
+    assert status["written"] == 0 and status["skipped"] == 1 and not status["ready"]
 
 
 @pytest.mark.parametrize("fraction", [-0.1, 1.1])

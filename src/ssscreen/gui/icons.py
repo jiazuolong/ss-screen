@@ -34,7 +34,7 @@ _ICON_SPECS = {
 }
 
 
-# 科研阶段（Stage 13 为GUI材料适配性评估，不启动额外科研计算）
+# 科研阶段（Stage 13 为GUI候选材料评价，不启动额外科研计算）
 _STAGE_ICON_SPECS = {
     "01": ("drive-harddisk", SP.SP_DriveHDIcon),
     "02": ("applications-science", SP.SP_ComputerIcon),

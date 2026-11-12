@@ -4,18 +4,15 @@ from __future__ import annotations
 
 import csv
 import json
-import math
 from pathlib import Path
 
-from pymatgen.core import Composition
-from PySide6.QtCore import QPointF, Qt, QUrl, QTimer
-from PySide6.QtGui import QColor, QPainter, QPen, QPixmap, QPolygonF
+from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtGui import QPixmap
 from PySide6.QtWebEngineCore import QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
-    QFrame,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -28,6 +25,9 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from .phase_page import PhaseResultsPage as PhaseResultsPage
+from .workflow_project import imported_artifact
 
 
 def _csv_rows(path: Path) -> list[dict[str, str]]:
@@ -164,6 +164,14 @@ class StructureResultsPage(QWidget):
         )
 
         seen: set[Path] = set()
+
+        # External runs retain their structures in their original directories.
+        index_path = imported_artifact(self._root(), "08_relax/structure_index.csv")
+        for row in _csv_rows(index_path):
+            path = Path(row["path"])
+            if path.is_file() and path.resolve() not in seen:
+                seen.add(path.resolve())
+                self.selector.addItem(row.get("label", path.name), str(path))
 
         for pattern in patterns:
             for path in sorted(self._root().glob(pattern)):
@@ -332,7 +340,7 @@ class PhononResultsPage(QWidget):
         return Path(self.project_provider()).expanduser().resolve()
 
     def refresh(self) -> None:
-        self.rows = _csv_rows(self._root() / "10_phonon" / "phonon_summary.csv")
+        self.rows = _csv_rows(imported_artifact(self._root(), "10_phonon/phonon_summary.csv"))
         self.table.setRowCount(0)
         keys = (
             "structure_id",
@@ -358,196 +366,11 @@ class PhononResultsPage(QWidget):
         row = self.rows[indexes[0].row()]
         phonon_id = row.get("phonon_id", "")
         result_dir = self._root() / "10_phonon" / "results" / phonon_id
-        self.image.set_image(result_dir / "phonon_band_dos.png")
+        plot = Path(row["plot_path"]) if row.get("plot_path") else result_dir / "phonon_band_dos.png"
+        self.image.set_image(plot)
         structure = (
             self._root() / "10_phonon" / "inputs" / phonon_id / "structures" / "reference.json"
         )
+        if row.get("reference_structure_path"):
+            structure = Path(row["reference_structure_path"])
         self.viewer.load_structure(structure, row.get("structure_id") or phonon_id)
-
-
-class TernaryHullCanvas(QFrame):
-    """Compact ternary composition map colored by energy above hull."""
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.rows: list[dict[str, str]] = []
-        self.elements: list[str] = []
-        self.setMinimumSize(430, 390)
-        self.setFrameShape(QFrame.StyledPanel)
-
-    def set_rows(self, rows: list[dict[str, str]]) -> None:
-        self.rows = rows
-        elements: set[str] = set()
-        for row in rows:
-            try:
-                elements.update(Composition(row.get("phase_composition", "")).elements)
-            except Exception:
-                continue
-        self.elements = sorted(str(element) for element in elements)[:3]
-        self.update()
-
-    def paintEvent(self, event) -> None:  # noqa: N802
-        super().paintEvent(event)
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-        margin = 48.0
-        width = max(10.0, self.width() - 2 * margin)
-        height = max(10.0, self.height() - 2 * margin)
-        side = min(width, height * 2 / math.sqrt(3))
-        triangle_height = side * math.sqrt(3) / 2
-        left = (self.width() - side) / 2
-        top = (self.height() - triangle_height) / 2
-        vertices = [
-            QPointF(left, top + triangle_height),
-            QPointF(left + side, top + triangle_height),
-            QPointF(left + side / 2, top),
-        ]
-        painter.setPen(QPen(QColor("#59636b"), 1.5))
-        painter.setBrush(QColor("#fafafa"))
-        painter.drawPolygon(QPolygonF(vertices))
-        if len(self.elements) == 3:
-            painter.drawText(vertices[0] + QPointF(-24, 22), self.elements[0])
-            painter.drawText(vertices[1] + QPointF(8, 22), self.elements[1])
-            painter.drawText(vertices[2] + QPointF(-8, -10), self.elements[2])
-
-        for row in self.rows:
-            try:
-                composition = Composition(row.get("phase_composition", "")).fractional_composition
-                fractions = [composition.get_atomic_fraction(element) for element in self.elements]
-                if len(fractions) != 3:
-                    continue
-                point = QPointF(
-                    sum(
-                        weight * vertex.x()
-                        for weight, vertex in zip(fractions, vertices, strict=True)
-                    ),
-                    sum(
-                        weight * vertex.y()
-                        for weight, vertex in zip(fractions, vertices, strict=True)
-                    ),
-                )
-                energy = float(row.get("phase_e_above_augmented_hull_eV_per_atom") or 0)
-                target = str(row.get("is_target", "")).lower() == "true"
-                color = (
-                    QColor("#b32424")
-                    if target
-                    else QColor("#2d7f5e" if energy <= 1e-6 else "#d39b32")
-                )
-                painter.setPen(QPen(QColor("#ffffff"), 1))
-                painter.setBrush(color)
-                radius = 7 if target else 5
-                painter.drawEllipse(point, radius, radius)
-            except Exception:
-                continue
-        painter.end()
-
-
-class PhaseResultsPage(QWidget):
-    """Stage 11 ternary hull map, entry table and linked MatterViz structure."""
-
-    def __init__(self, project_provider, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.project_provider = project_provider
-        self.rows: list[dict[str, str]] = []
-        root = QVBoxLayout(self)
-        root.setContentsMargins(12, 10, 12, 10)
-        header = QHBoxLayout()
-        title = QLabel("竞争相与凸包结果")
-        title.setObjectName("pageTitle")
-        header.addWidget(title)
-        self.count_label = QLabel("尚无相条目")
-        self.count_label.setObjectName("smallLabel")
-        header.addWidget(self.count_label)
-        header.addStretch(1)
-        refresh = QPushButton("刷新结果")
-        refresh.clicked.connect(self.refresh)
-        header.addWidget(refresh)
-        root.addLayout(header)
-
-        self.tabs = QTabWidget()
-        self.tabs.setDocumentMode(True)
-        hull_page = QWidget()
-        hull_layout = QVBoxLayout(hull_page)
-        hull_layout.setContentsMargins(0, 0, 0, 0)
-        splitter = QSplitter(Qt.Horizontal)
-        self.canvas = TernaryHullCanvas()
-        splitter.addWidget(self.canvas)
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(
-            ["相结构 ID", "组成", "角色", "凸包距离\n(eV/atom)", "目标"]
-        )
-        self.table.setMinimumWidth(650)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.table.setAlternatingRowColors(True)
-        self.table.verticalHeader().setVisible(False)
-        self.table.itemSelectionChanged.connect(self._selection_changed)
-        header_view = self.table.horizontalHeader()
-        header_view.setSectionResizeMode(0, QHeaderView.Stretch)
-        header_view.setSectionResizeMode(1, QHeaderView.Fixed)
-        header_view.setSectionResizeMode(2, QHeaderView.Fixed)
-        header_view.setSectionResizeMode(3, QHeaderView.Fixed)
-        header_view.setSectionResizeMode(4, QHeaderView.Fixed)
-        self.table.setColumnWidth(1, 90)
-        self.table.setColumnWidth(2, 110)
-        self.table.setColumnWidth(3, 125)
-        self.table.setColumnWidth(4, 60)
-        splitter.addWidget(self.table)
-        splitter.setChildrenCollapsible(False)
-        splitter.setStretchFactor(0, 2)
-        splitter.setStretchFactor(1, 3)
-        hull_layout.addWidget(splitter, 1)
-        self.tabs.addTab(hull_page, "凸包与竞争相")
-        self.viewer = MatterVizView()
-        self.viewer.setMinimumHeight(520)
-        self.tabs.addTab(self.viewer, "相结构（MatterViz）")
-        root.addWidget(self.tabs, 1)
-        self.refresh()
-
-    def _root(self) -> Path:
-        return Path(self.project_provider()).expanduser().resolve()
-
-    def refresh(self) -> None:
-        self.rows = _csv_rows(self._root() / "11_phase" / "hull_entries.csv")
-        self.count_label.setText(f"{len(self.rows)} 个相条目" if self.rows else "尚无相条目")
-        self.canvas.set_rows(self.rows)
-        self.table.setRowCount(0)
-        keys = (
-            "phase_structure_id",
-            "phase_composition",
-            "phase_role",
-            "phase_e_above_augmented_hull_eV_per_atom",
-            "is_target",
-        )
-        for row in self.rows:
-            position = self.table.rowCount()
-            self.table.insertRow(position)
-            for column, key in enumerate(keys):
-                raw = row.get(key, "")
-                display = raw
-                if key == "phase_role":
-                    display = "目标结构" if raw == "target" else "竞争相"
-                elif key == "phase_e_above_augmented_hull_eV_per_atom":
-                    try:
-                        display = f"{float(raw):.6f}"
-                    except ValueError:
-                        pass
-                elif key == "is_target":
-                    display = "是" if raw.lower() == "true" else "否"
-                item = QTableWidgetItem(display)
-                item.setToolTip(raw)
-                self.table.setItem(position, column, item)
-        if self.rows:
-            self.table.selectRow(0)
-
-    def _selection_changed(self) -> None:
-        indexes = self.table.selectionModel().selectedRows()
-        if not indexes:
-            return
-        row = self.rows[indexes[0].row()]
-        structure_id = row.get("phase_structure_id", "")
-        if str(row.get("is_target", "")).lower() == "true":
-            path = self._root() / "08_relax" / "structures" / f"{structure_id}.json"
-        else:
-            path = self._root() / "11_phase" / "relaxation" / "structures" / f"{structure_id}.json"
-        self.viewer.load_structure(path, f"{row.get('phase_composition')} · {structure_id}")
