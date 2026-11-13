@@ -28,10 +28,25 @@
 
 ## 接收方操作
 
-推荐使用当前仓库主分支的一键启动器。Windows PowerShell 在 clone 目录运行 `.\start-10um.cmd`，Ubuntu WSL 中运行 `bash scripts/start-10um.sh`，两条命令任选其一。首次需联网访问 GitHub 和 Python 包索引。启动器在当前目录的 `ss-screen-10um` 下准备数据、运行环境和独立工程，校验通过后打开 01 页。再次运行会复用已有工程及其进度。以下步骤供手动安装使用。
+推荐使用包含最新启动器修改的源码。Windows 文件夹中可双击 `start-10um.cmd`，或在 PowerShell 的 clone 目录运行 `.\start-10um.cmd`；Ubuntu WSL 中运行 `bash scripts/start-10um.sh`。首次需联网访问 GitHub、`api.nuget.org` 和 Python 包索引，Ubuntu WSL 及 Windows 互操作需预先可用。启动器在当前目录的 `ss-screen-10um` 下准备数据、运行环境和独立工程，校验通过后打开 01 页。再次运行会复用已有工程及其进度。以下步骤供手动安装使用。
 
 1. 下载本 Release 的源代码、`project-10um.zip`、`default.db.zip` 和离线读取器 wheel。展开工程压缩包后保留文件名 `10.0 μm演示.ssproject`。两个环境的 constraints 文本记录本次用到的软件版本。
 2. 在 Windows 源码目录用 Python 3.11 创建项目环境，激活后运行 `python -m pip install -c <Windows约束文件> -e ".[gui]"`。在 Ubuntu WSL 中进入同一源码目录，用 Python 3.11 创建并激活 `.venv`，运行 `python -m pip install -c <WSL约束文件> -e ".[mp]" <下载的mp_offline轮子路径>`。
 3. 在 Windows GUI 环境从源码目录运行 `python -m ssscreen.gui.app`。选择「打开工程文件.ssproject」，导入「10.0 μm演示.ssproject」到新目录。解开数据库压缩包，将 default.db 放入新工程的 01_dataset。WSL 后端应使用源码目录的 .venv。
 4. 从 01 开始，运行离线 Materials Project 获取；02 运行组成模板筛选。03 点右下角「进入 04 结构匹配与材料分组」校验预置描述，04 运行结构匹配，05 使用预置带隙，06 运行端元筛选。随后按上表推进至 13。按 SHA-256 核对下载文件；原始数据库指纹见上表。
 5. 数据来源为 Materials Project，数据库为离线快照；格式转换及演示筛选由 ss-screen 完成。请保留 Materials Project 署名及原始资料的引用。见 [Materials Project 引用说明](https://materialsproject.org/about/cite) 和 [使用条款](https://materialsproject.org/about/terms)。
+
+## 自动准备 Windows Python
+
+- 不依赖 `py.exe`。启动器实际执行版本、架构和标准库探针，优先复用健康的 GUI 环境或已安装的 Windows Python 3.11；发现解释器时禁止 uv 自动下载或选择 uv 管理的 Python，避免重复命中 error 4551。
+- 缺失时，从 [CPython 官方 NuGet 渠道](https://docs.python.org/3.11/using/windows.html#the-nuget-org-packages) 下载私有运行时，在解压前核验固定 SHA-256，解压后核验 `python.exe`、`pythonw.exe` 和 `python311.dll` 的有效 PSF 签名。无需安装 NuGet 客户端或 .NET SDK，无系统 Python 安装、PATH 修改或管理员提权。
+- 私有运行时固定为 3.11.9，与已有 Windows GUI 验收基线相同。它是该系列最后的 PSF Windows 二进制发行版，不包含之后仅以源码发布的 3.11 安全修复。后续升级需同时验收运行时、Windows 依赖约束和 GUI；维护者可通过 `SSSCREEN_WINDOWS_PYTHON` 指向已获准运行的匹配架构 Python 3.11，显式选择失败时不会静默切换。
+- GUI 创建环境时使用启动进程的绝对解释器路径。已有环境执行失败时，先保留为 `.venv-gui.unusable-<编号>` 再重建；工程与数据库保持原状。WSL 解释器仍单独管理，不接收 Windows 专用的 Python 选择设置。
+- 连接失败会自动重试，校验通过的下载会复用；错误后可重新运行相同入口。安装日志为 `setup.log`，GUI 输出为 `gui-startup.log`，均位于 `ss-screen-10um/`。若签名验证或应用控制策略仍阻止运行，日志记录文件路径及错误；不自动解除 Windows 防护。
+
+| 固定发行包 | SHA-256 |
+|---|---|
+| [python 3.11.9，Windows x64](https://www.nuget.org/packages/python/3.11.9) | `9283876d58c017e0e846f95b490da3bca0fc0a6ee1134b2870677cfb7eec3c67` |
+| [pythonarm64 3.11.9，Windows ARM64](https://www.nuget.org/packages/pythonarm64/3.11.9) | `2f5b3bee38850fdde1b44227a23b8130d329839558376d2eb11099ce2b2cc33c` |
+
+启动器回归入口为 `tests/test_start_10um.py`，其中 PowerShell 合约由 `tests/test_windows_python.ps1` 验证；在 WSL 项目环境中运行，Windows 检查经互操作调用系统自带的 Windows PowerShell/Pester。不下载演示数据库或执行科学计算。

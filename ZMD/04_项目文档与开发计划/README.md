@@ -1,5 +1,7 @@
 # 项目文档与开发计划导航
 
+- 2026-11-14：[交付清单](../../docs/reproducibility/demo_v1_delivery.md) 补充自动 Windows Python 准备、运行时来源/固定校验值、3.11.9 版本边界和错误日志位置；[项目日志](../../docs/PROJECT_LOG.md) 记录启动器修改与验证范围。
+
 - [仓库首页](../../README.md) 和 [复现说明](../../docs/reproducibility/demo_v1_delivery.md) 提供 clone 后在 PowerShell 或 Ubuntu WSL 中启动演示的命令。
 
 真实目录：[`docs/`](../../docs/) 和 [`plans/`](../../plans/)

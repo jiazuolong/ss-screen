@@ -20,6 +20,12 @@ cd ss-screen
 
 从 Ubuntu WSL 启动时，在克隆目录执行 `bash scripts/start-10um.sh`。启动器在**命令执行目录**创建 `ss-screen-10um/`，下载并校验数据，准备两套 Python 3.11 环境，导入演示工程并打开 Windows GUI 的 01 页。工程位于 `ss-screen-10um/project/`。再次运行同一命令会打开原工程；要从头演示，可从另一空目录调用同一脚本。WSL 和 Ubuntu 需事先安装。WSL 入口自动使用当前发行版（包括自定义名称）；PowerShell 从 Windows 盘启动时使用默认发行版。
 
+Windows 文件夹中的源码也可直接双击 `start-10um.cmd`。**不需要预装 Python、`py` 或手动设置环境变量**：启动器先验证已有 Windows Python 3.11；没有可用解释器时，自动下载 Python Software Foundation 官方 NuGet 运行时到 `ss-screen-10um/tools/`，核验固定 SHA-256 和程序签名，再用该解释器创建 GUI 环境。运行时和项目依赖保存在工作区，不修改系统 PATH。WSL 计算环境独立准备。
+
+首次运行需能访问 GitHub、`api.nuget.org` 和 Python 包索引。下载失败可再次双击重试；已有损坏的 GUI 环境会保留为 `.venv-gui.unusable-*` 后重建。安装过程记录在 `ss-screen-10um/setup.log`，GUI 日志在 `ss-screen-10um/gui-startup.log`；失败时 Windows 启动窗口会保留错误提示。
+
+备用运行时固定为与演示基线一致的官方 **Python 3.11.9**（3.11 系列最后的 PSF Windows 二进制发行版，并非最新安全补丁版本）；已安装且可运行的匹配架构 Python 3.11 优先复用。组织管理的应用控制策略仍可能拒绝官方程序，启动器会报告具体路径，不会关闭或修改系统防护。运行时来源及维护说明见[交付清单](docs/reproducibility/demo_v1_delivery.md)。
+
 [下载演示工程与数据库](https://github.com/jiazuolong/ss-screen/releases/tag/demo-10um-20261112) · [安装与逐步验收说明](docs/reproducibility/demo_v1_delivery.md)
 
 ## Scientific core

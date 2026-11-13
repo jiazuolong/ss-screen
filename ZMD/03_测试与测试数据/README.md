@@ -1,5 +1,7 @@
 # 测试与测试数据导航
 
+- 2026-11-14：[启动器回归](../../tests/test_start_10um.py) 验证解释器复用、损坏环境保留、错误版本/策略拦截及下载前失败；通过 WSL 调用 [PowerShell 合约](../../tests/test_windows_python.ps1)，覆盖无 Python 自动准备、显式选择失败、下载复用/中断/校验失败、错误签名和非自有目录保护。不访问网络或运行科学计算。
+
 真实目录：[`tests/`](../../tests/)、[`web/backend/tests/`](../../web/backend/tests/) 和 [`web/frontend/tests/`](../../web/frontend/tests/)
 
 当前有 23 个 Python 测试文件（含 `conftest.py`）；参数化展开后完整测试为 174 项。

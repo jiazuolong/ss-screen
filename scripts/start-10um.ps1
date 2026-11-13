@@ -1,6 +1,7 @@
 param([string]$WorkDir = (Get-Location).Path, [string]$Distribution)
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+. (Join-Path $PSScriptRoot 'windows-python.ps1')
 $directory = (Resolve-Path -LiteralPath $WorkDir).ProviderPath
 $workspace = [IO.Path]::Combine($directory, 'ss-screen-10um')
 if (!$Distribution -and $directory -match '^\\\\(?:wsl\.localhost|wsl\$)\\([^\\]+)') {
@@ -16,7 +17,10 @@ if ((Test-Path -LiteralPath $workspace) -and !(Test-Path -LiteralPath $owner) -a
 }
 [IO.Directory]::CreateDirectory($workspace) | Out-Null
 $lock = [IO.File]::Open($owner, 'OpenOrCreate', 'ReadWrite', 'None')
+$transcribing = $false
 try {
+    Start-Transcript -LiteralPath (Join-Path $workspace 'setup.log') -Append | Out-Null
+    $transcribing = $true
     & wsl.exe @wslArgs --exec true
     if ($LASTEXITCODE) { throw 'Start an Ubuntu WSL distribution and make it the default before running this command.' }
     $arch = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
@@ -32,15 +36,7 @@ try {
         $archive = Join-Path $tools 'uv-windows.zip'
         $platform, $hash = $builds[$arch]
         $url = "https://github.com/astral-sh/uv/releases/download/0.9.18/uv-$platform-pc-windows-msvc.zip"
-        Write-Host 'Downloading Windows environment manager...'
-        & curl.exe --fail --location --retry 3 --connect-timeout 30 --speed-time 120 --speed-limit 1024 --silent --show-error --output $archive $url
-        if ($LASTEXITCODE) { throw 'Windows uv download failed.' }
-        $sha = [Security.Cryptography.SHA256]::Create()
-        $stream = [IO.File]::OpenRead($archive)
-        try {
-            $actual = [BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '')
-        } finally { $stream.Dispose(); $sha.Dispose() }
-        if ($actual -ne $hash) { throw 'Windows uv download failed verification.' }
+        Save-LauncherDownload $url $archive $hash
         Add-Type -AssemblyName System.IO.Compression.FileSystem
         $zip = [IO.Compression.ZipFile]::OpenRead($archive)
         try {
@@ -49,6 +45,15 @@ try {
         } finally { $zip.Dispose() }
         Move-Item -LiteralPath "$uv.tmp" -Destination $uv
     }
-    & $uv run --no-project --python 3.11 -- (Join-Path $PSScriptRoot 'start_10um.py') $workspace
+    $python = Resolve-LauncherPython $uv $workspace $arch
+    Write-Host "Using Windows Python: $python"
+    & $python (Join-Path $PSScriptRoot 'start_10um.py') $workspace
     if ($LASTEXITCODE) { throw "Setup failed (exit $LASTEXITCODE). Retry the same command after resolving the error above." }
-} finally { $lock.Dispose() }
+} catch {
+    Write-Host "Setup failed: $($_.Exception.Message)"
+    Write-Host "Details: $(Join-Path $workspace 'setup.log')"
+    throw
+} finally {
+    if ($transcribing) { Stop-Transcript | Out-Null }
+    $lock.Dispose()
+}

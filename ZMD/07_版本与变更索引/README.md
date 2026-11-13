@@ -1,5 +1,7 @@
 # 版本与变更索引
 
+- 2026-11-14：新增 windows-python.ps1、test_start_10um.py 和 test_windows_python.ps1，更新 start-10um.ps1/start_10um.py/start-10um.cmd，实现官方私有运行时自动准备、解释器复用、损坏环境备份、连接重试和安装日志；同步 README、交付清单、PROJECT_LOG 及入口/脚本/测试/文档导航。修改限定用户授权的当前 C 盘工作副本。
+
 - 2026-11-13：登记 03 页面右下角主按钮、演示校验及 04 导航。
 
 - 2026-11-13：登记 WSL 原生目录启动、发行版选择及 GUI 后端连接验证。

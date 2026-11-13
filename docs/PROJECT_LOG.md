@@ -1,3 +1,23 @@
+## 2026-11-14 — 自动准备可运行的 Windows Python
+
+**本次工作目标：** 修复新电脑没有 py 或 uv Python 被应用控制拦截时的一键启动流程。
+
+**已完成：**
+- 新增 `scripts/windows-python.ps1`：实际探测解释器版本/架构/标准库，缺失时自动获取 PSF 官方 NuGet 私有运行时，核验固定 SHA-256 及 Python 程序/DLL 签名；校验通过后再使用，不修改系统 PATH 或防护策略。
+- 更新 `scripts/start-10um.ps1`、`scripts/start_10um.py` 和 `start-10um.cmd`：固定复用已验证的 Windows 解释器，下载数据库前检查 GUI 环境，保留损坏环境后重建，补充连接错误重试、setup.log 和失败窗口提示。
+- 新增 `tests/test_start_10um.py`、`tests/test_windows_python.ps1`；WSL 项目 `.venv` 聚焦回归 **18 通过**（其中包含 **11 项 PowerShell/Pester 合约**）。Black、Ruff、PowerShell 语法解析及兼容既有 CRLF 的 Git 空白检查通过。
+- 在忽略目录 `work/launcher_validation/` 实测 x64 官方包下载、SHA/有效 PSF 签名、创建及复用 Windows GUI 虚拟环境；中文路径下 PowerShell/CMD 入口、发行版参数、日志和锁释放通过，下游使用无数据下载的入口探针。初次网络连接中断据实触发失败，加入 retry-all-errors 后重试下载成功。
+- 同步 README、`docs/reproducibility/demo_v1_delivery.md` 及 ZMD 入口/脚本/测试/文档/变更索引。
+- 发布副本基于 GitHub 最新 master，显式复用项目 WSL 环境并从发布副本导入源码，聚焦回归再次 **18 通过**；Black/Ruff、PowerShell 语法及 14 个新增导航链接检查通过。
+
+**决策 / 计划变更：**
+- 用户已授权当前 `C:\Users\19756\Desktop\重要文件\ss-screen-local` 工作副本；AGENTS.md 中的 D 盘路径为历史位置，本轮未修改其他工作副本或已有科研结果。
+- 自动备用运行时采用演示 Windows 基线 3.11.9（最后的 PSF 3.11 Windows 二进制，并非最新安全补丁版）；正常的已安装 Python 3.11 优先复用，版本维护边界在交付清单明确说明。WSL 计算环境和科学算法不变。发布以公开 master 的 3c9c3bd 为基线，只移入本次启动器修复；本地其他未提交修改不纳入本次发布。
+
+**下一步：** 按用户要求将修复推送至 jiazuolong/ss-screen 的 master；接收方更新源码，在实际应用控制策略下验证首次打开 GUI。
+
+**阻塞项 / 上游问题：** 本机 `\\wsl.localhost\Ubuntu\mnt\c\...` 访问返回 Access is denied，未完成 UNC 入口重复验收；未在 ARM64 硬件及用户新电脑运行，未重新下载完整数据库或做全新 GUI 依赖安装。组织策略仍可能拒绝官方签名程序，启动器仅报告错误，不解除策略。
+
 ## 2026-11-13 — 03 页面直接进入 04
 
 **本次工作目标：** 用 03 页面按钮完成演示预置描述校验并打开 04。

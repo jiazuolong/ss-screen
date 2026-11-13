@@ -1,5 +1,7 @@
 # 项目入口与配置
 
+- 2026-11-14：[README](../../README.md) 和 [CMD 启动入口](../../start-10um.cmd) 支持双击自动准备私有 Windows Python；无需 py/PATH 手工配置，失败保留窗口与日志。固定运行时版本、签名校验及应用控制限制见[交付清单](../../docs/reproducibility/demo_v1_delivery.md)。
+
 本目录导航仓库根部的权威入口文件。开始开发前，先通过这些文件确认规则、用途、依赖和许可证。
 
 ## 文件映射

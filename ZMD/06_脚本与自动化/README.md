@@ -1,5 +1,7 @@
 # 脚本与自动化导航
 
+- 2026-11-14：[Windows Python 引导库](../../scripts/windows-python.ps1) 验证已有解释器，缺失时自动下载并校验官方私有运行时；[PowerShell 入口](../../scripts/start-10um.ps1) 记录 setup.log，[工作区准备](../../scripts/start_10um.py) 固定复用解释器并保留损坏环境后重建。[CMD 入口](../../start-10um.cmd) 失败时保留窗口。对应回归：[Python](../../tests/test_start_10um.py)、[PowerShell](../../tests/test_windows_python.ps1)；来源和版本限制见[交付清单](../../docs/reproducibility/demo_v1_delivery.md)。
+
 - 从 WSL 原生路径启动时，start-10um.sh 传递当前发行版；PowerShell 使用原生 UNC 路径建立目录。GUI 对工程 UNC 共享选择相同的 WSL 后端。
 
 - Windows 启动器使用 .NET 核验 uv 下载，公开仓库克隆验收覆盖 Windows wheel 内的数据读取模块及 GUI 到 WSL 的 01 命令连接。
