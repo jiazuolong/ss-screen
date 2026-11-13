@@ -28,7 +28,7 @@
 
 ## 接收方操作
 
-推荐使用当前仓库主分支的一键启动器。Windows PowerShell 在 clone 目录运行 `.\start-10um.cmd`，默认 Ubuntu WSL 中运行 `bash scripts/start-10um.sh`，两条命令任选其一。首次需联网访问 GitHub 和 Python 包索引。启动器在当前目录的 `ss-screen-10um` 下准备数据、运行环境和独立工程，校验通过后打开 01 页。再次运行会复用已有工程及其进度。以下步骤供手动安装使用。
+推荐使用当前仓库主分支的一键启动器。Windows PowerShell 在 clone 目录运行 `.\start-10um.cmd`，Ubuntu WSL 中运行 `bash scripts/start-10um.sh`，两条命令任选其一。首次需联网访问 GitHub 和 Python 包索引。启动器在当前目录的 `ss-screen-10um` 下准备数据、运行环境和独立工程，校验通过后打开 01 页。再次运行会复用已有工程及其进度。以下步骤供手动安装使用。
 
 1. 下载本 Release 的源代码、`project-10um.zip`、`default.db.zip` 和离线读取器 wheel。展开工程压缩包后保留文件名 `10.0 μm演示.ssproject`。两个环境的 constraints 文本记录本次用到的软件版本。
 2. 在 Windows 源码目录用 Python 3.11 创建项目环境，激活后运行 `python -m pip install -c <Windows约束文件> -e ".[gui]"`。在 Ubuntu WSL 中进入同一源码目录，用 Python 3.11 创建并激活 `.venv`，运行 `python -m pip install -c <WSL约束文件> -e ".[mp]" <下载的mp_offline轮子路径>`。

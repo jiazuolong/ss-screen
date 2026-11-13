@@ -18,7 +18,7 @@ cd ss-screen
 .\start-10um.cmd
 ```
 
-从默认的 Ubuntu WSL 启动时，在克隆目录执行 `bash scripts/start-10um.sh`。启动器在**命令执行目录**创建 `ss-screen-10um/`，下载并校验数据，准备两套 Python 3.11 环境，导入演示工程并打开 Windows GUI 的 01 页。工程位于 `ss-screen-10um/project/`。再次运行同一命令会打开原工程；要从头演示，可从另一空目录调用同一脚本。WSL 和 Ubuntu 需事先安装，并能通过默认的 `wsl.exe` 进入。
+从 Ubuntu WSL 启动时，在克隆目录执行 `bash scripts/start-10um.sh`。启动器在**命令执行目录**创建 `ss-screen-10um/`，下载并校验数据，准备两套 Python 3.11 环境，导入演示工程并打开 Windows GUI 的 01 页。工程位于 `ss-screen-10um/project/`。再次运行同一命令会打开原工程；要从头演示，可从另一空目录调用同一脚本。WSL 和 Ubuntu 需事先安装。WSL 入口自动使用当前发行版（包括自定义名称）；PowerShell 从 Windows 盘启动时使用默认发行版。
 
 [下载演示工程与数据库](https://github.com/jiazuolong/ss-screen/releases/tag/demo-10um-20261112) · [安装与逐步验收说明](docs/reproducibility/demo_v1_delivery.md)
 

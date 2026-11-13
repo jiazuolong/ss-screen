@@ -1,7 +1,14 @@
-param([string]$WorkDir = (Get-Location).Path)
+param([string]$WorkDir = (Get-Location).Path, [string]$Distribution)
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-$workspace = Join-Path (Resolve-Path -LiteralPath $WorkDir).Path 'ss-screen-10um'
+$directory = (Resolve-Path -LiteralPath $WorkDir).ProviderPath
+$workspace = [IO.Path]::Combine($directory, 'ss-screen-10um')
+if (!$Distribution -and $directory -match '^\\\\(?:wsl\.localhost|wsl\$)\\([^\\]+)') {
+    $Distribution = $Matches[1]
+}
+$wslArgs = @()
+if ($Distribution) { $wslArgs = @('-d', $Distribution) }
+$env:SSSCREEN_WSL_DISTRO = $Distribution
 $owner = Join-Path $workspace '.ss-screen-launcher-v1'
 if ((Test-Path -LiteralPath $workspace) -and !(Test-Path -LiteralPath $owner) -and
     (Get-ChildItem -Force -LiteralPath $workspace | Select-Object -First 1)) {
@@ -10,7 +17,7 @@ if ((Test-Path -LiteralPath $workspace) -and !(Test-Path -LiteralPath $owner) -a
 [IO.Directory]::CreateDirectory($workspace) | Out-Null
 $lock = [IO.File]::Open($owner, 'OpenOrCreate', 'ReadWrite', 'None')
 try {
-    & wsl.exe --exec true
+    & wsl.exe @wslArgs --exec true
     if ($LASTEXITCODE) { throw 'Start an Ubuntu WSL distribution and make it the default before running this command.' }
     $arch = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
     $builds = @{

@@ -6981,7 +6981,7 @@ class MainWindow(QMainWindow):
             backend_activate,
             converted,
         )
-        return "wsl.exe bash -lc " + shlex.quote(command)
+        return shlex.join(["wsl.exe", *self._wsl_distribution_args(root), "bash", "-lc", command])
 
     def _wsl_process(
         self,
@@ -6999,7 +6999,15 @@ class MainWindow(QMainWindow):
             converted,
             api_key=self.api_key.text().strip(),
         )
-        return "wsl.exe", ["bash", "-lc", command]
+        return "wsl.exe", [*self._wsl_distribution_args(root), "bash", "-lc", command]
+
+    @staticmethod
+    def _wsl_distribution_args(root: Path) -> list[str]:
+        share = PureWindowsPath(root).drive
+        distro = os.environ.get("SSSCREEN_WSL_DISTRO")
+        if share.lower().startswith(("\\\\wsl.localhost\\", "\\\\wsl$\\")):
+            distro = share.rsplit("\\", 1)[1]
+        return ["-d", distro] if distro else []
 
     def _wsl_root_for_project(self, root: Path) -> str:
         override = self.wsl_root.text().strip()
