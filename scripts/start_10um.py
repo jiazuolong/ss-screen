@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import shlex
 import shutil
@@ -45,8 +46,13 @@ def download(url, path, expected):
     partial.replace(path)
 
 
+def wsl_command(*args):
+    distro = os.environ.get("SSSCREEN_WSL_DISTRO")
+    return ["wsl.exe", *(["-d", distro] if distro else []), "--exec", *args]
+
+
 def wsl_text(*args):
-    return subprocess.check_output(["wsl.exe", "--exec", *args], encoding="utf-8").strip()
+    return subprocess.check_output(wsl_command(*args), encoding="utf-8").strip()
 
 
 def wsl_path(path):
@@ -107,7 +113,7 @@ def launch(workspace):
         with tarfile.open(archive) as tar, partial.open("wb") as stream:
             with tar.extractfile(f"{bundle}/uv") as uv:
                 shutil.copyfileobj(uv, stream)
-        subprocess.run(["wsl.exe", "--exec", "chmod", "+x", wsl_path(partial)], check=True)
+        subprocess.run(wsl_command("chmod", "+x", wsl_path(partial)), check=True)
         partial.replace(binary)
 
     # The GUI and CLI have separate interpreters even when they share the checkout.
@@ -132,7 +138,7 @@ def launch(workspace):
                     "-e", wsl_path(REPO) + "[mp]", linux_cache + WHEEL]),
         shlex.join([venv + "/bin/python", "-c", "import ssscreen, mp_offline.client"]),
     ]
-    subprocess.run(["wsl.exe", "--exec", "bash", "-lc", " && ".join(commands)], check=True)
+    subprocess.run(wsl_command("bash", "-lc", " && ".join(commands)), check=True)
     subprocess.run([python, __file__, workspace, "--prepare"], check=True)
     project = workspace / "project"
     print(f"Opening stage 01: {project}", flush=True)
