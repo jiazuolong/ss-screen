@@ -2520,10 +2520,7 @@ class StructureArchivePage(QWidget):
         self.stop_button.setEnabled(False)
         self.stop_button.setToolTip("完成当前结构后停止，保存已完成描述及运行记录；再次运行可续算。")
         self.stop_button.clicked.connect(self.stop_requested.emit)
-        self.use_completed_button = QPushButton("使用已完成结果进入 04")
-        self.use_completed_button.clicked.connect(self.use_completed_requested.emit)
         controls.addWidget(self.stop_button)
-        controls.addWidget(self.use_completed_button)
         controls.addStretch(1)
         root.addLayout(controls)
 
@@ -2547,6 +2544,11 @@ class StructureArchivePage(QWidget):
         text.setObjectName("optionHelp")
         boundary_layout.addWidget(text)
         root.addWidget(boundary)
+
+        self.use_completed_button = QPushButton("进入 04 结构匹配与材料分组")
+        self.use_completed_button.setObjectName("primaryButton")
+        self.use_completed_button.clicked.connect(self.use_completed_requested.emit)
+        root.addWidget(self.use_completed_button, 0, Qt.AlignRight)
 
         self.refresh_archive()
         self._refresh_df_preview()
@@ -6094,6 +6096,11 @@ class MainWindow(QMainWindow):
                 return
             self._handoff_after_stop = True
             self.stop_process()
+            return
+        if self.workflow.settings.get("ten_micron_profile"):
+            from ssscreen.gui.ten_micron_page import accept_cache
+
+            accept_cache(self, stage=3)
             return
         archive = self.structure_archive_page._resolve(self.structure_archive_page.df_output_dir.text())
         if not archive.is_dir() or not any(archive.glob("*.json")):

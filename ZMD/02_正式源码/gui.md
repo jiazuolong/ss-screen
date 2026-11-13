@@ -1,5 +1,7 @@
 # GUI 导航
 
+- 03 页右下角「进入 04 结构匹配与材料分组」在演示工程校验预置结构描述；普通工程使用已完成的归档。
+
 真实目录：[`src/ssscreen/gui/`](../../src/ssscreen/gui/)
 
 设计说明：[`docs/gui_integration_notes.md`](../../docs/gui_integration_notes.md)
