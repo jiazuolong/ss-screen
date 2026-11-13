@@ -33,5 +33,5 @@
 1. 下载本 Release 的源代码、`project-10um.zip`、`default.db.zip` 和离线读取器 wheel。展开工程压缩包后保留文件名 `10.0 μm演示.ssproject`。两个环境的 constraints 文本记录本次用到的软件版本。
 2. 在 Windows 源码目录用 Python 3.11 创建项目环境，激活后运行 `python -m pip install -c <Windows约束文件> -e ".[gui]"`。在 Ubuntu WSL 中进入同一源码目录，用 Python 3.11 创建并激活 `.venv`，运行 `python -m pip install -c <WSL约束文件> -e ".[mp]" <下载的mp_offline轮子路径>`。
 3. 在 Windows GUI 环境从源码目录运行 `python -m ssscreen.gui.app`。选择「打开工程文件.ssproject」，导入「10.0 μm演示.ssproject」到新目录。解开数据库压缩包，将 default.db 放入新工程的 01_dataset。WSL 后端应使用源码目录的 .venv。
-4. 从 01 开始，运行离线 Materials Project 获取；02 运行组成模板筛选。03 使用预置描述，04 运行结构匹配，05 使用预置带隙，06 运行端元筛选。随后按上表推进至 13。按 SHA-256 核对下载文件；原始数据库指纹见上表。
+4. 从 01 开始，运行离线 Materials Project 获取；02 运行组成模板筛选。03 点右下角「进入 04 结构匹配与材料分组」校验预置描述，04 运行结构匹配，05 使用预置带隙，06 运行端元筛选。随后按上表推进至 13。按 SHA-256 核对下载文件；原始数据库指纹见上表。
 5. 数据来源为 Materials Project，数据库为离线快照；格式转换及演示筛选由 ss-screen 完成。请保留 Materials Project 署名及原始资料的引用。见 [Materials Project 引用说明](https://materialsproject.org/about/cite) 和 [使用条款](https://materialsproject.org/about/terms)。
